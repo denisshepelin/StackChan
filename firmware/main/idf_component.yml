@@ -23,6 +23,7 @@ dependencies:
   78/esp-wifi-connect: ~3.1.1
   espressif/esp_audio_effects: ~1.2.1
   espressif/esp_audio_codec: ~2.4.1
+  espressif/esp_websocket_client: ^1.7.0
   78/esp-ml307: ~3.6.4
   78/uart-eth-modem:
     version: ~0.3.3
@@ -31,7 +32,7 @@ dependencies:
   78/xiaozhi-fonts: ~1.6.0
   espressif/led_strip: ~3.0.2
   espressif/esp_codec_dev: ~1.5.4
-  espressif/esp-sr: ~2.3.0
+  espressif/esp-sr: ~2.4.6
   espressif/button: ~4.1.5
   espressif/knob: ^1.0.0
   espressif/esp32-camera:

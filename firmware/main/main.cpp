@@ -39,6 +39,7 @@ extern "C" void app_main(void)
         GetMooncake().installApp(std::make_unique<AppEzdata>());
         GetMooncake().installApp(std::make_unique<AppDance>());
         GetMooncake().installApp(std::make_unique<AppSetup>());
+        GetMooncake().installApp(std::make_unique<AppGeminiLive>());
 
         // Main loop
         while (1) {

@@ -1,2 +1,5 @@
 .DS_Store
+.env
+firmware/sdkconfig.defaults.local
 .idea/
+firmware/build-host-tests/

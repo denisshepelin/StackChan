@@ -133,6 +133,14 @@ enum class MicTestStatus {
     Failed,
 };
 
+enum class GeminiLiveStatus {
+    Connecting = 0,
+    Ready,
+    Listening,
+    Speaking,
+    Error,
+};
+
 /**
  * @brief
  *
@@ -300,6 +308,13 @@ public:
     std::string startMicTest(std::function<void(MicTestStatus)> onStatusUpdate);
     void getMicWaveformFrame(std::vector<int16_t>& data);
     void clearupMicTest();
+
+    /* ------------------------------ Gemini Live ------------------------------ */
+    uitk::Signal<GeminiLiveStatus, const std::string&> onGeminiLiveStatus;
+    bool startGeminiLiveService(std::function<void(std::string_view)> onLog);
+    bool startGeminiLiveTurn();
+    void stopGeminiLiveTurn();
+    void stopGeminiLiveService();
 
 private:
     bool _xiaozhi_start_requested = false;

@@ -1,6 +1,28 @@
 # Define xiaozhi source directory
 set(XIAOZHI_MAIN_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../xiaozhi-esp32/main")
 
+set(GEMINI_API_KEY "")
+if(DEFINED ENV{GOOGLE_API_KEY} AND NOT "$ENV{GOOGLE_API_KEY}" STREQUAL "")
+    set(GEMINI_API_KEY "$ENV{GOOGLE_API_KEY}")
+elseif(EXISTS "${CMAKE_CURRENT_LIST_DIR}/../../.env")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+                 "${CMAKE_CURRENT_LIST_DIR}/../../.env")
+    file(STRINGS "${CMAKE_CURRENT_LIST_DIR}/../../.env" GEMINI_API_KEY_LINE
+         REGEX "^GOOGLE_API_KEY=" LIMIT_COUNT 1)
+    string(REGEX REPLACE "^GOOGLE_API_KEY=['\"]?([^'\"]*)['\"]?$" "\\1"
+           GEMINI_API_KEY "${GEMINI_API_KEY_LINE}")
+endif()
+
+set(GEMINI_CONFIG_DIR "${CMAKE_BINARY_DIR}/generated")
+file(MAKE_DIRECTORY "${GEMINI_CONFIG_DIR}")
+configure_file("${CMAKE_CURRENT_LIST_DIR}/hal/gemini_config.h.in"
+               "${GEMINI_CONFIG_DIR}/gemini_config.h" @ONLY)
+if(GEMINI_API_KEY STREQUAL "")
+    message(WARNING "StackChan: GOOGLE_API_KEY is unavailable; GEMINI.LIVE cannot connect")
+else()
+    message(STATUS "StackChan: embedding GOOGLE_API_KEY for direct Gemini Live access")
+endif()
+
 file(GLOB_RECURSE STACK_CHAN_SOURCES
     "apps/*.c"
     "apps/*.cc"
@@ -17,6 +39,7 @@ file(GLOB_RECURSE STACK_CHAN_SOURCES
 )
 set(STACK_CHAN_INCLUDE_DIRS 
     "."
+    "${GEMINI_CONFIG_DIR}"
 )
 list(APPEND STACK_CHAN_SOURCES main.cpp)
 
