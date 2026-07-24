@@ -153,7 +153,7 @@ void AppGeminiLive::onClose()
         view::destroy_status_bar();
     }
 
-    GetHAL().requestWarmReboot(7);
+    GetHAL().requestWarmReboot(0);
 }
 
 void AppGeminiLive::handleStatus(GeminiLiveStatus status, const std::string& message)
