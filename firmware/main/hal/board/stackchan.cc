@@ -114,6 +114,31 @@ public:
         return true;
     }
 
+    // Status polls share the bus with the audio codecs; ReadReg would abort the system on a timeout
+    bool TryGetPowerState(bool& external_power, bool& charging, bool& discharging)
+    {
+        uint8_t status = 0;
+        if (TryReadRegs(0x01, &status, 1) != ESP_OK) {
+            return false;
+        }
+        const uint8_t current_direction = (status & 0b01100000) >> 5;
+        const bool is_charging_done     = (status & 0b00000111) == 0b00000100;
+        external_power                  = current_direction != 2 || is_charging_done;
+        charging                        = current_direction == 1;
+        discharging                     = current_direction == 2;
+        return true;
+    }
+
+    bool TryGetBatteryLevel(int& level)
+    {
+        uint8_t value = 0;
+        if (TryReadRegs(0xA4, &value, 1) != ESP_OK) {
+            return false;
+        }
+        level = value;
+        return true;
+    }
+
     bool IsExternalPowerConnected()
     {
         const uint8_t power_status      = ReadReg(0x01);
@@ -276,7 +301,13 @@ private:
         }
         last_power_state_check_ms_ = now_ms;
 
-        UpdatePowerSaveEnabled(pmic_->IsExternalPowerConnected(), pmic_->IsDischarging());
+        bool has_external_power = false;
+        bool is_charging        = false;
+        bool is_discharging     = false;
+        if (!pmic_->TryGetPowerState(has_external_power, is_charging, is_discharging)) {
+            return;
+        }
+        UpdatePowerSaveEnabled(has_external_power, is_discharging);
     }
 
     void InitializePowerSaveTimer()
@@ -527,14 +558,14 @@ public:
     virtual bool GetBatteryLevel(int& level, bool& charging, bool& discharging) override
     {
         static bool last_discharging = false;
-        charging                     = pmic_->IsCharging();
-        discharging                  = pmic_->IsDischarging();
+        bool has_external_power      = false;
+        if (!pmic_->TryGetPowerState(has_external_power, charging, discharging) || !pmic_->TryGetBatteryLevel(level)) {
+            return false;
+        }
         if (discharging != last_discharging) {
             power_save_timer_->SetEnabled(discharging);
             last_discharging = discharging;
         }
-
-        level = pmic_->GetBatteryLevel();
         return true;
     }
 
