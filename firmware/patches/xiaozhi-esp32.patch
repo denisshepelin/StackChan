@@ -271,3 +271,35 @@ index 7bc917b..874b137 100644
  };
  
  #endif // I2C_DEVICE_H
+diff --git a/main/audio/audio_codec.cc b/main/audio/audio_codec.cc
+index 03e2baa..34d217d 100644
+--- a/main/audio/audio_codec.cc
++++ b/main/audio/audio_codec.cc
+@@ -17,3 +17,7 @@ AudioCodec::~AudioCodec() {
+ void AudioCodec::OutputData(std::vector<int16_t>& data) {
+-    Write(data.data(), data.size());
++    OutputData(data.data(), data.size());
++}
++
++void AudioCodec::OutputData(const int16_t* data, size_t samples) {
++    Write(data, samples);
+ }
+@@ -21,3 +25,7 @@ void AudioCodec::OutputData(std::vector<int16_t>& data) {
+ bool AudioCodec::InputData(std::vector<int16_t>& data) {
+-    int samples = Read(data.data(), data.size());
++    return InputData(data.data(), data.size());
++}
++
++bool AudioCodec::InputData(int16_t* data, size_t sample_count) {
++    int samples = Read(data, sample_count);
+     if (samples > 0) {
+diff --git a/main/audio/audio_codec.h b/main/audio/audio_codec.h
+index 819e646..f3723ea 100644
+--- a/main/audio/audio_codec.h
++++ b/main/audio/audio_codec.h
+@@ -27,3 +27,5 @@ public:
+     virtual void OutputData(std::vector<int16_t>& data);
++    void OutputData(const int16_t* data, size_t samples);
+     virtual bool InputData(std::vector<int16_t>& data);
++    bool InputData(int16_t* data, size_t samples);
+     virtual void Start();

@@ -27,17 +27,23 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <limits>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 namespace {
 
+constexpr uint32_t kInternalCaps      = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
+constexpr uint32_t kPsramCaps         = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;
 constexpr size_t kCaptureFrames       = AUDIO_INPUT_SAMPLE_RATE * 32 / 1000;
 constexpr uint32_t kAecSampleRate     = 16000;
 constexpr int kAecFilterLength        = 4;
 constexpr size_t kAecFrameSamples     = kAecSampleRate * 32 / 1000;
+constexpr size_t kPlaybackFrameSamples = AUDIO_OUTPUT_SAMPLE_RATE * 32 / 1000;
 constexpr size_t kUplinkQueueFrames   = 24;
 constexpr size_t kMaxPlaybackChunks   = 64;
 constexpr int32_t kPlaybackGainPercent = 60;
@@ -63,8 +69,99 @@ struct AudioFrame {
 static_assert(sizeof(AudioFrame) == kAecFrameSamples * sizeof(int16_t));
 static_assert(sizeof(std::array<AudioFrame, 2>) == 2 * sizeof(AudioFrame));
 
+template <typename T, uint32_t Caps>
+class CapabilityAllocator {
+public:
+    using value_type = T;
+    using is_always_equal = std::true_type;
+
+    CapabilityAllocator() noexcept = default;
+
+    template <typename U>
+    CapabilityAllocator(const CapabilityAllocator<U, Caps>&) noexcept
+    {
+    }
+
+    [[nodiscard]] T* allocate(size_t count)
+    {
+        if (count == 0) {
+            return nullptr;
+        }
+        if (count > std::numeric_limits<size_t>::max() / sizeof(T)) {
+            throw std::bad_array_new_length();
+        }
+        auto* memory = static_cast<T*>(heap_caps_malloc(count * sizeof(T), Caps));
+        if (!memory) {
+            throw std::bad_alloc();
+        }
+        return memory;
+    }
+
+    void deallocate(T* memory, size_t) noexcept
+    {
+        heap_caps_free(memory);
+    }
+
+    template <typename U>
+    struct rebind {
+        using other = CapabilityAllocator<U, Caps>;
+    };
+};
+
+template <typename T, typename U, uint32_t Caps>
+constexpr bool operator==(const CapabilityAllocator<T, Caps>&, const CapabilityAllocator<U, Caps>&) noexcept
+{
+    return true;
+}
+
+template <typename T, typename U, uint32_t Caps>
+constexpr bool operator!=(const CapabilityAllocator<T, Caps>&, const CapabilityAllocator<U, Caps>&) noexcept
+{
+    return false;
+}
+
+using InternalAudioBuffer = std::vector<int16_t, CapabilityAllocator<int16_t, kInternalCaps>>;
+using PsramAudioBuffer    = std::vector<int16_t, CapabilityAllocator<int16_t, kPsramCaps>>;
+using PsramString = std::basic_string<char, std::char_traits<char>, CapabilityAllocator<char, kPsramCaps>>;
+using PsramPlaybackQueue =
+    std::deque<PsramAudioBuffer, CapabilityAllocator<PsramAudioBuffer, kPsramCaps>>;
+
+class PsramJsonAllocator final : public ArduinoJson::Allocator {
+public:
+    void* allocate(size_t size) override
+    {
+        return heap_caps_malloc(size, kPsramCaps);
+    }
+
+    void deallocate(void* memory) override
+    {
+        heap_caps_free(memory);
+    }
+
+    void* reallocate(void* memory, size_t size) override
+    {
+        return heap_caps_realloc(memory, size, kPsramCaps);
+    }
+};
+
+PsramJsonAllocator psram_json_allocator;
+
 class GeminiLiveClient {
 public:
+    static void* operator new(size_t size)
+    {
+        auto* memory = heap_caps_malloc(size, kInternalCaps);
+        if (!memory) {
+            throw std::bad_alloc();
+        }
+        return memory;
+    }
+
+    static void operator delete(void* memory) noexcept
+    {
+        heap_caps_free(memory);
+    }
+
     ~GeminiLiveClient()
     {
         stop();
@@ -87,9 +184,8 @@ public:
             emitStatus(GeminiLiveStatus::Error, "Echo cancellation unavailable");
             return false;
         }
-        _uplink_queue = xQueueCreate(kUplinkQueueFrames, sizeof(AudioFrame));
-        if (!_uplink_queue) {
-            emitStatus(GeminiLiveStatus::Error, "Could not create audio queue");
+        if (!initializeAudioBuffers()) {
+            emitStatus(GeminiLiveStatus::Error, "Could not create audio buffers");
             return false;
         }
 
@@ -195,14 +291,50 @@ public:
         destroyClient();
         _connected = false;
         destroyAec();
-        if (_uplink_queue) {
-            vQueueDelete(_uplink_queue);
-            _uplink_queue = nullptr;
-        }
+        destroyAudioBuffers();
         esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
     }
 
 private:
+    bool initializeAudioBuffers()
+    {
+        _active_audio_frames = static_cast<AudioFrame*>(
+            heap_caps_aligned_calloc(16, 2, sizeof(AudioFrame), kInternalCaps));
+        _uplink_queue_storage = static_cast<uint8_t*>(
+            heap_caps_malloc(kUplinkQueueFrames * sizeof(AudioFrame), kPsramCaps));
+        if (!_active_audio_frames || !_uplink_queue_storage) {
+            destroyAudioBuffers();
+            return false;
+        }
+
+        _uplink_queue = xQueueCreateStatic(kUplinkQueueFrames, sizeof(AudioFrame), _uplink_queue_storage,
+                                           &_uplink_queue_control);
+        if (!_uplink_queue) {
+            destroyAudioBuffers();
+            return false;
+        }
+
+        mclog::tagInfo(kTag, "Audio buffers: active={}B internal, uplink={}B psram",
+                       2 * sizeof(AudioFrame), kUplinkQueueFrames * sizeof(AudioFrame));
+        return true;
+    }
+
+    void destroyAudioBuffers()
+    {
+        if (_uplink_queue) {
+            vQueueDelete(_uplink_queue);
+            _uplink_queue = nullptr;
+        }
+        if (_uplink_queue_storage) {
+            heap_caps_free(_uplink_queue_storage);
+            _uplink_queue_storage = nullptr;
+        }
+        if (_active_audio_frames) {
+            heap_caps_free(_active_audio_frames);
+            _active_audio_frames = nullptr;
+        }
+    }
+
     bool initializeAec()
     {
         esp_ae_rate_cvt_cfg_t resampler_config = {
@@ -225,7 +357,7 @@ private:
             .sample_rate   = kAecSampleRate,
             .caps          = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT,
             .mode          = AEC_MODE_FD_LOW_COST,
-            .nlp_level     = AEC_NLP_LEVEL_AGGR,
+            .nlp_level     = AEC_NLP_LEVEL_NORMAL,
         };
         const size_t internal_before = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
         const size_t psram_before    = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
@@ -246,9 +378,9 @@ private:
             return false;
         }
         const size_t bytes = _aec_chunk_frames * sizeof(int16_t);
-        _aec_mic           = static_cast<int16_t*>(heap_caps_aligned_alloc(16, bytes, MALLOC_CAP_8BIT));
-        _aec_reference     = static_cast<int16_t*>(heap_caps_aligned_alloc(16, bytes, MALLOC_CAP_8BIT));
-        _aec_output        = static_cast<int16_t*>(heap_caps_aligned_alloc(16, bytes, MALLOC_CAP_8BIT));
+        _aec_mic           = static_cast<int16_t*>(heap_caps_aligned_alloc(16, bytes, kInternalCaps));
+        _aec_reference     = static_cast<int16_t*>(heap_caps_aligned_alloc(16, bytes, kInternalCaps));
+        _aec_output        = static_cast<int16_t*>(heap_caps_aligned_alloc(16, bytes, kInternalCaps));
         if (!_aec_mic || !_aec_reference || !_aec_output) {
             destroyAec();
             return false;
@@ -289,7 +421,9 @@ private:
 
     bool connectSession()
     {
-        _url = std::string(kGeminiEndpoint) + STACKCHAN_GEMINI_API_KEY;
+        _url.clear();
+        _url.append(kGeminiEndpoint);
+        _url.append(STACKCHAN_GEMINI_API_KEY);
         esp_websocket_client_config_t config{};
         config.uri                    = _url.c_str();
         config.crt_bundle_attach      = esp_crt_bundle_attach;
@@ -438,8 +572,8 @@ private:
     void captureTask()
     {
         const size_t input_channels = std::max(_codec->input_channels(), 1);
-        std::vector<int16_t> input(kCaptureFrames * input_channels);
-        std::vector<int16_t> resampled(_resampled_capacity * input_channels);
+        InternalAudioBuffer input(kCaptureFrames * input_channels);
+        InternalAudioBuffer resampled(_resampled_capacity * input_channels);
 
         while (_running) {
             if (_transport_failed.exchange(false)) {
@@ -485,7 +619,7 @@ private:
                     _codec->EnableInput(true);
                 }
 
-                if (_codec->InputData(input)) {
+                if (_codec->InputData(input.data(), input.size())) {
                     uint32_t resampled_frames = _resampled_capacity;
                     if (esp_ae_rate_cvt_process(_input_resampler, input.data(), kCaptureFrames, resampled.data(),
                                                 &resampled_frames) == ESP_AE_ERR_OK) {
@@ -504,9 +638,13 @@ private:
                         const bool echo_possible = _speaking || _codec->output_enabled();
                         if (echo_possible) {
                             const int64_t aec_started_at = esp_timer_get_time();
-                            aec_process(_aec, _aec_mic, _aec_reference, _aec_output);
+                            aec_linear_process(_aec, _aec_mic, _aec_reference, _aec_output);
                             recordDuration(_aec_time_us, _aec_max_us,
                                            static_cast<uint32_t>(esp_timer_get_time() - aec_started_at));
+                            recordMaximum(_mic_max_level, meanMagnitude(_aec_mic, _aec_chunk_frames));
+                            recordMaximum(_reference_max_level,
+                                          meanMagnitude(_aec_reference, _aec_chunk_frames));
+                            recordMaximum(_aec_max_level, meanMagnitude(_aec_output, _aec_chunk_frames));
                             ++_aec_frames;
                         }
                         const int16_t* uplink = echo_possible ? _aec_output : _aec_mic;
@@ -533,14 +671,13 @@ private:
 
     void enqueueAudio(const int16_t* samples)
     {
-        std::copy_n(samples, kAecFrameSamples, _capture_frame.samples);
-        if (xQueueSend(_uplink_queue, &_capture_frame, 0) == pdTRUE) {
+        if (xQueueSend(_uplink_queue, samples, 0) == pdTRUE) {
             recordMaximum(_uplink_max_depth, uxQueueMessagesWaiting(_uplink_queue));
             return;
         }
 
-        xQueueReceive(_uplink_queue, &_capture_discard, 0);
-        if (xQueueSend(_uplink_queue, &_capture_frame, 0) == pdTRUE) {
+        xQueueReceive(_uplink_queue, &_active_audio_frames[0], 0);
+        if (xQueueSend(_uplink_queue, samples, 0) == pdTRUE) {
             ++_uplink_drops;
         }
     }
@@ -548,22 +685,19 @@ private:
     void sendTask()
     {
         while (_running) {
-            if (xQueueReceive(_uplink_queue, &_send_buffer[0], pdMS_TO_TICKS(100)) != pdTRUE) {
+            auto* send_buffer = &_active_audio_frames[1];
+            if (xQueueReceive(_uplink_queue, &send_buffer[0], pdMS_TO_TICKS(100)) != pdTRUE) {
                 continue;
             }
             if (!_streaming || !_connected) {
                 continue;
             }
 
-            size_t sample_count = kAecFrameSamples;
-            if (xQueueReceive(_uplink_queue, &_send_buffer[1], pdMS_TO_TICKS(36)) == pdTRUE) {
-                sample_count += kAecFrameSamples;
-            }
             const int64_t send_started_at = esp_timer_get_time();
-            if (!sendAudio(_send_buffer[0].samples, sample_count)) {
+            if (!sendAudio(send_buffer[0].samples, kAecFrameSamples)) {
                 ++_uplink_send_timeouts;
                 while (uxQueueMessagesWaiting(_uplink_queue) > 2 &&
-                       xQueueReceive(_uplink_queue, &_send_discard, 0) == pdTRUE) {
+                       xQueueReceive(_uplink_queue, &send_buffer[0], 0) == pdTRUE) {
                     ++_uplink_drops;
                 }
             }
@@ -579,7 +713,7 @@ private:
     {
         bool waiting_for_audio = false;
         while (_running) {
-            std::vector<int16_t> samples;
+            PsramAudioBuffer samples;
             {
                 std::lock_guard<std::mutex> lock(_playback_mutex);
                 if (!_playback.empty()) {
@@ -593,7 +727,11 @@ private:
                 if (!_codec->output_enabled()) {
                     _codec->EnableOutput(true);
                 }
-                _codec->OutputData(samples);
+                for (size_t offset = 0; offset < samples.size() && _running && _speaking;
+                     offset += kPlaybackFrameSamples) {
+                    const size_t frame_samples = std::min(kPlaybackFrameSamples, samples.size() - offset);
+                    _codec->OutputData(samples.data() + offset, frame_samples);
+                }
                 continue;
             }
 
@@ -628,7 +766,7 @@ private:
 
     void handleMessage(const char* data, size_t length)
     {
-        ArduinoJson::JsonDocument document;
+        ArduinoJson::JsonDocument document(&psram_json_allocator);
         if (ArduinoJson::deserializeJson(document, data, length)) {
             emitStatus(GeminiLiveStatus::Error, "Invalid Gemini response");
             return;
@@ -736,7 +874,7 @@ private:
             return;
         }
 
-        std::vector<int16_t> decoded((decoded_capacity + sizeof(int16_t) - 1) / sizeof(int16_t));
+        PsramAudioBuffer decoded((decoded_capacity + sizeof(int16_t) - 1) / sizeof(int16_t));
         size_t decoded_size = 0;
         if (mbedtls_base64_decode(reinterpret_cast<unsigned char*>(decoded.data()),
                                   decoded.size() * sizeof(int16_t), &decoded_size,
@@ -773,6 +911,15 @@ private:
         GetHAL().onGeminiLiveStatus.emit(status, message);
     }
 
+    static uint32_t meanMagnitude(const int16_t* samples, size_t count)
+    {
+        uint32_t total = 0;
+        for (size_t index = 0; index < count; ++index) {
+            total += static_cast<uint32_t>(std::abs(static_cast<int32_t>(samples[index])));
+        }
+        return count ? total / count : 0;
+    }
+
     static void recordDuration(std::atomic<uint32_t>& total, std::atomic<uint32_t>& maximum, uint32_t duration)
     {
         total += duration;
@@ -788,10 +935,13 @@ private:
 
     void resetPerformanceCounters()
     {
-        _aec_frames         = 0;
-        _aec_time_us        = 0;
-        _aec_max_us         = 0;
-        _send_frames        = 0;
+        _aec_frames          = 0;
+        _aec_time_us         = 0;
+        _aec_max_us          = 0;
+        _mic_max_level       = 0;
+        _reference_max_level = 0;
+        _aec_max_level       = 0;
+        _send_frames         = 0;
         _send_time_us       = 0;
         _send_max_us        = 0;
         _playback_chunks    = 0;
@@ -814,11 +964,12 @@ private:
                        _playback_task ? uxTaskGetStackHighWaterMark(_playback_task) : 0,
                        heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
         mclog::tagInfo(kTag,
-                       "Perf: AEC avg={}us max={}us; send avg={}us max={}us; "
-                       "uplink max_queue={} drops={} timeouts={}; "
+                       "Perf: AEC avg={}us max={}us levels mic/ref/out={}/{}/{}; "
+                       "send avg={}us max={}us; uplink max_queue={} drops={} timeouts={}; "
                        "playback chunks={} bytes={} max_queue={} underruns={} drops={}",
                        aec_frames ? static_cast<uint32_t>(_aec_time_us) / aec_frames : 0,
-                       static_cast<uint32_t>(_aec_max_us),
+                       static_cast<uint32_t>(_aec_max_us), static_cast<uint32_t>(_mic_max_level),
+                       static_cast<uint32_t>(_reference_max_level), static_cast<uint32_t>(_aec_max_level),
                        send_frames ? static_cast<uint32_t>(_send_time_us) / send_frames : 0,
                        static_cast<uint32_t>(_send_max_us), static_cast<uint32_t>(_uplink_max_depth),
                        static_cast<uint32_t>(_uplink_drops), static_cast<uint32_t>(_uplink_send_timeouts),
@@ -835,18 +986,17 @@ private:
     int16_t* _aec_output = nullptr;
     size_t _aec_chunk_frames = 0;
     uint32_t _resampled_capacity = 0;
-    std::vector<int16_t> _aec_input;
-    // Kept off the task stacks; sendAudio() reads both _send_buffer entries as one contiguous block
-    std::array<AudioFrame, 2> _send_buffer{};
-    AudioFrame _send_discard{};
-    AudioFrame _capture_frame{};
-    AudioFrame _capture_discard{};
+    InternalAudioBuffer _aec_input;
+    // Queue discard and the active send workspace stay in internal SRAM.
+    AudioFrame* _active_audio_frames = nullptr;
+    uint8_t* _uplink_queue_storage = nullptr;
+    StaticQueue_t _uplink_queue_control{};
     QueueHandle_t _uplink_queue = nullptr;
     esp_websocket_client_handle_t _client = nullptr;
-    std::string _url;
-    std::string _incoming_message;
-    std::string _encoded_audio;
-    std::string _audio_message;
+    PsramString _url;
+    PsramString _incoming_message;
+    PsramString _encoded_audio;
+    PsramString _audio_message;
     TaskHandle_t _capture_task       = nullptr;
     TaskHandle_t _send_task          = nullptr;
     TaskHandle_t _playback_task      = nullptr;
@@ -868,6 +1018,9 @@ private:
     std::atomic<uint32_t> _aec_frames = 0;
     std::atomic<uint32_t> _aec_time_us = 0;
     std::atomic<uint32_t> _aec_max_us = 0;
+    std::atomic<uint32_t> _mic_max_level = 0;
+    std::atomic<uint32_t> _reference_max_level = 0;
+    std::atomic<uint32_t> _aec_max_level = 0;
     std::atomic<uint32_t> _send_frames = 0;
     std::atomic<uint32_t> _send_time_us = 0;
     std::atomic<uint32_t> _send_max_us = 0;
@@ -881,7 +1034,7 @@ private:
     std::atomic<uint32_t> _uplink_send_timeouts = 0;
     std::mutex _protocol_mutex;
     std::mutex _playback_mutex;
-    std::deque<std::vector<int16_t>> _playback;
+    PsramPlaybackQueue _playback;
 };
 
 std::unique_ptr<GeminiLiveClient> gemini_live_client;
