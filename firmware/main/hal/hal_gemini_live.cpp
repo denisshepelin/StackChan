@@ -44,7 +44,8 @@ constexpr uint32_t kAecSampleRate     = 16000;
 constexpr int kAecFilterLength        = 4;
 constexpr size_t kAecFrameSamples     = kAecSampleRate * 32 / 1000;
 constexpr size_t kPlaybackFrameSamples = AUDIO_OUTPUT_SAMPLE_RATE * 32 / 1000;
-constexpr size_t kUplinkQueueFrames   = 24;
+constexpr size_t kPlaybackPrebufferSamples = AUDIO_OUTPUT_SAMPLE_RATE * 150 / 1000;
+constexpr size_t kUplinkQueueFrames   = 8;
 constexpr size_t kMaxPlaybackChunks   = 64;
 constexpr int32_t kPlaybackGainPercent = 60;
 // Sized from measured high-water marks, with margin for the websocket error path that is not on them
@@ -62,12 +63,88 @@ const char* kGeminiEndpoint =
     "google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=";
 constexpr char kSetupMessage[] =
     R"json({"setup":{"model":"models/gemini-3.1-flash-live-preview","generationConfig":{"responseModalities":["AUDIO"]},"realtimeInputConfig":{"automaticActivityDetection":{"disabled":false,"startOfSpeechSensitivity":"START_SENSITIVITY_HIGH","prefixPaddingMs":20},"activityHandling":"START_OF_ACTIVITY_INTERRUPTS"},"inputAudioTranscription":{}}})json";
+constexpr std::string_view kAudioMessagePrefix = R"json({"realtimeInput":{"audio":{"data":")json";
+constexpr std::string_view kAudioMessageSuffix = R"json(","mimeType":"audio/pcm;rate=16000"}}})json";
 
 struct AudioFrame {
     int16_t samples[kAecFrameSamples];
 };
 static_assert(sizeof(AudioFrame) == kAecFrameSamples * sizeof(int16_t));
 static_assert(sizeof(std::array<AudioFrame, 2>) == 2 * sizeof(AudioFrame));
+
+bool isJsonWhitespace(char value)
+{
+    return value == ' ' || value == '\n' || value == '\r' || value == '\t';
+}
+
+size_t findJsonObjectEnd(std::string_view json, size_t object_start)
+{
+    size_t depth    = 0;
+    bool in_string  = false;
+    bool is_escaped = false;
+    for (size_t index = object_start; index < json.size(); ++index) {
+        const char value = json[index];
+        if (in_string) {
+            if (is_escaped) {
+                is_escaped = false;
+            } else if (value == '\\') {
+                is_escaped = true;
+            } else if (value == '"') {
+                in_string = false;
+            }
+            continue;
+        }
+        if (value == '"') {
+            in_string = true;
+        } else if (value == '{') {
+            ++depth;
+        } else if (value == '}' && --depth == 0) {
+            return index;
+        }
+    }
+    return std::string_view::npos;
+}
+
+std::string_view findJsonStringValue(std::string_view object, std::string_view key)
+{
+    size_t position = 0;
+    while ((position = object.find(key, position)) != std::string_view::npos) {
+        if (position == 0 || object[position - 1] != '"' || position + key.size() >= object.size() ||
+            object[position + key.size()] != '"') {
+            position += key.size();
+            continue;
+        }
+        position += key.size() + 1;
+        while (position < object.size() && isJsonWhitespace(object[position])) {
+            ++position;
+        }
+        if (position >= object.size() || object[position++] != ':') {
+            continue;
+        }
+        while (position < object.size() && isJsonWhitespace(object[position])) {
+            ++position;
+        }
+        if (position >= object.size() || object[position++] != '"') {
+            continue;
+        }
+
+        const size_t value_start = position;
+        bool is_escaped          = false;
+        for (; position < object.size(); ++position) {
+            const char value = object[position];
+            if (is_escaped) {
+                return {};
+            }
+            if (value == '\\') {
+                is_escaped = true;
+            } else if (value == '"') {
+                return object.substr(value_start, position - value_start);
+            }
+        }
+        return {};
+    }
+    return {};
+}
 
 template <typename T, uint32_t Caps>
 class CapabilityAllocator {
@@ -148,6 +225,14 @@ PsramJsonAllocator psram_json_allocator;
 
 class GeminiLiveClient {
 public:
+    GeminiLiveClient() : _response_filter(&psram_json_allocator)
+    {
+        _response_filter["setupComplete"]                              = true;
+        _response_filter["serverContent"]["inputTranscription"]["text"] = true;
+        _response_filter["serverContent"]["interrupted"]              = true;
+        _response_filter["serverContent"]["turnComplete"]             = true;
+    }
+
     static void* operator new(size_t size)
     {
         auto* memory = heap_caps_malloc(size, kInternalCaps);
@@ -623,33 +708,20 @@ private:
                     uint32_t resampled_frames = _resampled_capacity;
                     if (esp_ae_rate_cvt_process(_input_resampler, input.data(), kCaptureFrames, resampled.data(),
                                                 &resampled_frames) == ESP_AE_ERR_OK) {
-                        _aec_input.insert(_aec_input.end(), resampled.begin(),
+                        const size_t aec_input_samples = _aec_chunk_frames * input_channels;
+                        size_t offset                  = 0;
+                        if (_aec_input.empty()) {
+                            while (_streaming && _connected && resampled_frames - offset >= _aec_chunk_frames) {
+                                processAecFrame(resampled.data() + offset * input_channels, input_channels);
+                                offset += _aec_chunk_frames;
+                            }
+                        }
+                        _aec_input.insert(_aec_input.end(), resampled.begin() + offset * input_channels,
                                           resampled.begin() + resampled_frames * input_channels);
-                    }
-
-                    const size_t aec_input_samples = _aec_chunk_frames * input_channels;
-                    while (_streaming && _connected && _aec_input.size() >= aec_input_samples) {
-                        for (size_t frame = 0; frame < _aec_chunk_frames; ++frame) {
-                            _aec_mic[frame]       = _aec_input[frame * input_channels];
-                            _aec_reference[frame] = _aec_input[frame * input_channels + 1];
+                        while (_streaming && _connected && _aec_input.size() >= aec_input_samples) {
+                            processAecFrame(_aec_input.data(), input_channels);
+                            _aec_input.erase(_aec_input.begin(), _aec_input.begin() + aec_input_samples);
                         }
-                        // Only the speaker produces echo; with a silent reference the adaptive
-                        // filter has no excitation to converge on, so running it would be waste
-                        const bool echo_possible = _speaking || _codec->output_enabled();
-                        if (echo_possible) {
-                            const int64_t aec_started_at = esp_timer_get_time();
-                            aec_linear_process(_aec, _aec_mic, _aec_reference, _aec_output);
-                            recordDuration(_aec_time_us, _aec_max_us,
-                                           static_cast<uint32_t>(esp_timer_get_time() - aec_started_at));
-                            recordMaximum(_mic_max_level, meanMagnitude(_aec_mic, _aec_chunk_frames));
-                            recordMaximum(_reference_max_level,
-                                          meanMagnitude(_aec_reference, _aec_chunk_frames));
-                            recordMaximum(_aec_max_level, meanMagnitude(_aec_output, _aec_chunk_frames));
-                            ++_aec_frames;
-                        }
-                        const int16_t* uplink = echo_possible ? _aec_output : _aec_mic;
-                        enqueueAudio(uplink);
-                        _aec_input.erase(_aec_input.begin(), _aec_input.begin() + aec_input_samples);
                     }
                 }
                 continue;
@@ -667,6 +739,24 @@ private:
         }
         _capture_task = nullptr;
         vTaskDelete(nullptr);
+    }
+
+    void processAecFrame(const int16_t* input, size_t input_channels)
+    {
+        for (size_t frame = 0; frame < _aec_chunk_frames; ++frame) {
+            _aec_mic[frame]       = input[frame * input_channels];
+            _aec_reference[frame] = input[frame * input_channels + 1];
+        }
+
+        const bool echo_possible = _speaking || _codec->output_enabled();
+        if (echo_possible) {
+            const int64_t aec_started_at = esp_timer_get_time();
+            aec_linear_process(_aec, _aec_mic, _aec_reference, _aec_output);
+            recordDuration(_aec_time_us, _aec_max_us,
+                           static_cast<uint32_t>(esp_timer_get_time() - aec_started_at));
+            ++_aec_frames;
+        }
+        enqueueAudio(echo_possible ? _aec_output : _aec_mic);
     }
 
     void enqueueAudio(const int16_t* samples)
@@ -712,13 +802,19 @@ private:
     void playbackTask()
     {
         bool waiting_for_audio = false;
+        bool playback_started  = false;
         while (_running) {
             PsramAudioBuffer samples;
+            bool starting_playback = false;
             {
                 std::lock_guard<std::mutex> lock(_playback_mutex);
-                if (!_playback.empty()) {
-                    samples = std::move(_playback.front());
+                const bool enough_audio = _playback_queued_samples >= kPlaybackPrebufferSamples;
+                if (!_playback.empty() && (playback_started || enough_audio || _turn_complete)) {
+                    starting_playback = !playback_started;
+                    playback_started  = true;
+                    samples           = std::move(_playback.front());
                     _playback.pop_front();
+                    _playback_queued_samples -= samples.size();
                 }
             }
 
@@ -726,6 +822,9 @@ private:
                 waiting_for_audio = false;
                 if (!_codec->output_enabled()) {
                     _codec->EnableOutput(true);
+                }
+                if (starting_playback) {
+                    emitStatus(GeminiLiveStatus::Speaking, "");
                 }
                 for (size_t offset = 0; offset < samples.size() && _running && _speaking;
                      offset += kPlaybackFrameSamples) {
@@ -737,6 +836,7 @@ private:
 
             if (_turn_complete.exchange(false)) {
                 logPerformanceCounters();
+                playback_started = false;
                 _speaking = false;
                 if (_codec->output_enabled()) {
                     _codec->EnableOutput(false);
@@ -752,6 +852,7 @@ private:
                 waiting_for_audio = true;
             }
             if (_codec->output_enabled() && !_speaking) {
+                playback_started = false;
                 _codec->EnableOutput(false);
             }
             ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(20));
@@ -767,7 +868,8 @@ private:
     void handleMessage(const char* data, size_t length)
     {
         ArduinoJson::JsonDocument document(&psram_json_allocator);
-        if (ArduinoJson::deserializeJson(document, data, length)) {
+        if (ArduinoJson::deserializeJson(document, data, length,
+                                         ArduinoJson::DeserializationOption::Filter(_response_filter))) {
             emitStatus(GeminiLiveStatus::Error, "Invalid Gemini response");
             return;
         }
@@ -792,20 +894,7 @@ private:
             mclog::tagInfo(kTag, "Input: {}", input_transcription);
         }
 
-        auto parts = server_content["modelTurn"]["parts"];
-        if (parts.is<ArduinoJson::JsonArray>()) {
-            for (auto part : parts.as<ArduinoJson::JsonArray>()) {
-                const char* mime_type = part["inlineData"]["mimeType"] | "";
-                const char* encoded   = part["inlineData"]["data"] | "";
-                if (std::strncmp(mime_type, "audio/pcm", 9) == 0 && encoded[0] != '\0') {
-                    warnOnRateMismatch(mime_type);
-                    queueAudio(encoded);
-                    if (!_speaking.exchange(true)) {
-                        emitStatus(GeminiLiveStatus::Speaking, "");
-                    }
-                }
-            }
-        }
+        queueInlineAudio(std::string_view(data, length));
 
         const bool interrupted = server_content["interrupted"] | false;
         if (interrupted) {
@@ -831,66 +920,105 @@ private:
         const auto* bytes             = reinterpret_cast<const unsigned char*>(samples);
         const size_t byte_count       = sample_count * sizeof(int16_t);
         const size_t encoded_capacity = 4 * ((byte_count + 2) / 3) + 1;
-        _encoded_audio.resize(encoded_capacity);
+        const size_t encoded_offset   = kAudioMessagePrefix.size();
+        _audio_message.assign(kAudioMessagePrefix);
+        _audio_message.resize(encoded_offset + encoded_capacity + kAudioMessageSuffix.size());
+
         size_t encoded_size = 0;
-        if (mbedtls_base64_encode(reinterpret_cast<unsigned char*>(_encoded_audio.data()), encoded_capacity,
-                                  &encoded_size, bytes, byte_count) != 0) {
+        if (mbedtls_base64_encode(reinterpret_cast<unsigned char*>(_audio_message.data() + encoded_offset),
+                                  encoded_capacity, &encoded_size, bytes, byte_count) != 0) {
             return false;
         }
-        _encoded_audio.resize(encoded_size);
-
-        _audio_message.clear();
-        _audio_message.append("{\"realtimeInput\":{\"audio\":{\"data\":\"");
-        _audio_message.append(_encoded_audio);
-        _audio_message.append("\",\"mimeType\":\"audio/pcm;rate=16000\"}}}");
+        std::memcpy(_audio_message.data() + encoded_offset + encoded_size, kAudioMessageSuffix.data(),
+                    kAudioMessageSuffix.size());
+        _audio_message.resize(encoded_offset + encoded_size + kAudioMessageSuffix.size());
         return sendText(_audio_message, kAudioSendTimeoutMs);
     }
 
-    // Playback feeds the codec unresampled, so a rate other than the codec's would play at the wrong speed
-    void warnOnRateMismatch(const char* mime_type)
+    void queueInlineAudio(std::string_view message)
     {
-        const char* rate_field = std::strstr(mime_type, "rate=");
-        if (!rate_field) {
+        constexpr std::string_view inline_data_key = "\"inlineData\"";
+        size_t position = 0;
+        while ((position = message.find(inline_data_key, position)) != std::string_view::npos) {
+            position += inline_data_key.size();
+            while (position < message.size() && isJsonWhitespace(message[position])) {
+                ++position;
+            }
+            if (position >= message.size() || message[position++] != ':') {
+                continue;
+            }
+            while (position < message.size() && isJsonWhitespace(message[position])) {
+                ++position;
+            }
+            if (position >= message.size() || message[position] != '{') {
+                continue;
+            }
+
+            const size_t object_end = findJsonObjectEnd(message, position);
+            if (object_end == std::string_view::npos) {
+                return;
+            }
+            const std::string_view object = message.substr(position, object_end - position + 1);
+            const std::string_view mime_type = findJsonStringValue(object, "mimeType");
+            const std::string_view encoded   = findJsonStringValue(object, "data");
+            if (mime_type.starts_with("audio/pcm") && !encoded.empty()) {
+                warnOnRateMismatch(mime_type);
+                queueAudio(encoded);
+            }
+            position = object_end + 1;
+        }
+    }
+
+    // Playback feeds the codec unresampled, so a rate other than the codec's would play at the wrong speed
+    void warnOnRateMismatch(std::string_view mime_type)
+    {
+        const size_t rate_position = mime_type.find("rate=");
+        if (rate_position == std::string_view::npos) {
             return;
         }
-        const long rate = std::strtol(rate_field + 5, nullptr, 10);
+
+        long rate = 0;
+        for (size_t position = rate_position + 5; position < mime_type.size(); ++position) {
+            const char digit = mime_type[position];
+            if (digit < '0' || digit > '9') {
+                break;
+            }
+            rate = rate * 10 + digit - '0';
+        }
         if (rate > 0 && rate != AUDIO_OUTPUT_SAMPLE_RATE && !_rate_mismatch_logged.exchange(true)) {
             mclog::tagError(kTag, "Gemini audio rate {} does not match codec rate {}; playback speed will be wrong",
                             rate, AUDIO_OUTPUT_SAMPLE_RATE);
         }
     }
 
-    void queueAudio(const char* encoded)
+    bool queueAudio(std::string_view encoded)
     {
-        if (!_streaming) {
-            return;
+        if (!_streaming || encoded.empty()) {
+            return false;
         }
 
-        const size_t encoded_size = std::strlen(encoded);
-        size_t decoded_capacity   = 0;
-        mbedtls_base64_decode(nullptr, 0, &decoded_capacity, reinterpret_cast<const unsigned char*>(encoded),
-                              encoded_size);
-        if (decoded_capacity == 0) {
-            return;
-        }
-
+        const size_t decoded_capacity = ((encoded.size() + 3) / 4) * 3;
         PsramAudioBuffer decoded((decoded_capacity + sizeof(int16_t) - 1) / sizeof(int16_t));
         size_t decoded_size = 0;
         if (mbedtls_base64_decode(reinterpret_cast<unsigned char*>(decoded.data()),
                                   decoded.size() * sizeof(int16_t), &decoded_size,
-                                  reinterpret_cast<const unsigned char*>(encoded), encoded_size) != 0) {
-            return;
+                                  reinterpret_cast<const unsigned char*>(encoded.data()), encoded.size()) != 0 ||
+            decoded_size == 0 || decoded_size % sizeof(int16_t) != 0) {
+            return false;
         }
         decoded.resize(decoded_size / sizeof(int16_t));
         std::transform(decoded.begin(), decoded.end(), decoded.begin(), [](int16_t sample) {
             return static_cast<int16_t>(static_cast<int32_t>(sample) * kPlaybackGainPercent / 100);
         });
+        _speaking = true;
 
         std::lock_guard<std::mutex> lock(_playback_mutex);
         if (_playback.size() >= kMaxPlaybackChunks) {
+            _playback_queued_samples -= _playback.front().size();
             _playback.pop_front();
             ++_playback_drops;
         }
+        _playback_queued_samples += decoded.size();
         _playback.push_back(std::move(decoded));
         ++_playback_chunks;
         _playback_bytes += decoded_size;
@@ -898,26 +1026,19 @@ private:
         if (_playback_task) {
             xTaskNotifyGive(_playback_task);
         }
+        return true;
     }
 
     void clearPlayback()
     {
         std::lock_guard<std::mutex> lock(_playback_mutex);
         _playback.clear();
+        _playback_queued_samples = 0;
     }
 
     void emitStatus(GeminiLiveStatus status, std::string message)
     {
         GetHAL().onGeminiLiveStatus.emit(status, message);
-    }
-
-    static uint32_t meanMagnitude(const int16_t* samples, size_t count)
-    {
-        uint32_t total = 0;
-        for (size_t index = 0; index < count; ++index) {
-            total += static_cast<uint32_t>(std::abs(static_cast<int32_t>(samples[index])));
-        }
-        return count ? total / count : 0;
     }
 
     static void recordDuration(std::atomic<uint32_t>& total, std::atomic<uint32_t>& maximum, uint32_t duration)
@@ -935,13 +1056,10 @@ private:
 
     void resetPerformanceCounters()
     {
-        _aec_frames          = 0;
-        _aec_time_us         = 0;
-        _aec_max_us          = 0;
-        _mic_max_level       = 0;
-        _reference_max_level = 0;
-        _aec_max_level       = 0;
-        _send_frames         = 0;
+        _aec_frames         = 0;
+        _aec_time_us        = 0;
+        _aec_max_us         = 0;
+        _send_frames        = 0;
         _send_time_us       = 0;
         _send_max_us        = 0;
         _playback_chunks    = 0;
@@ -964,12 +1082,11 @@ private:
                        _playback_task ? uxTaskGetStackHighWaterMark(_playback_task) : 0,
                        heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
         mclog::tagInfo(kTag,
-                       "Perf: AEC avg={}us max={}us levels mic/ref/out={}/{}/{}; "
-                       "send avg={}us max={}us; uplink max_queue={} drops={} timeouts={}; "
+                       "Perf: AEC avg={}us max={}us; send avg={}us max={}us; "
+                       "uplink max_queue={} drops={} timeouts={}; "
                        "playback chunks={} bytes={} max_queue={} underruns={} drops={}",
                        aec_frames ? static_cast<uint32_t>(_aec_time_us) / aec_frames : 0,
-                       static_cast<uint32_t>(_aec_max_us), static_cast<uint32_t>(_mic_max_level),
-                       static_cast<uint32_t>(_reference_max_level), static_cast<uint32_t>(_aec_max_level),
+                       static_cast<uint32_t>(_aec_max_us),
                        send_frames ? static_cast<uint32_t>(_send_time_us) / send_frames : 0,
                        static_cast<uint32_t>(_send_max_us), static_cast<uint32_t>(_uplink_max_depth),
                        static_cast<uint32_t>(_uplink_drops), static_cast<uint32_t>(_uplink_send_timeouts),
@@ -995,8 +1112,8 @@ private:
     esp_websocket_client_handle_t _client = nullptr;
     PsramString _url;
     PsramString _incoming_message;
-    PsramString _encoded_audio;
     PsramString _audio_message;
+    ArduinoJson::JsonDocument _response_filter;
     TaskHandle_t _capture_task       = nullptr;
     TaskHandle_t _send_task          = nullptr;
     TaskHandle_t _playback_task      = nullptr;
@@ -1018,9 +1135,6 @@ private:
     std::atomic<uint32_t> _aec_frames = 0;
     std::atomic<uint32_t> _aec_time_us = 0;
     std::atomic<uint32_t> _aec_max_us = 0;
-    std::atomic<uint32_t> _mic_max_level = 0;
-    std::atomic<uint32_t> _reference_max_level = 0;
-    std::atomic<uint32_t> _aec_max_level = 0;
     std::atomic<uint32_t> _send_frames = 0;
     std::atomic<uint32_t> _send_time_us = 0;
     std::atomic<uint32_t> _send_max_us = 0;
@@ -1035,6 +1149,7 @@ private:
     std::mutex _protocol_mutex;
     std::mutex _playback_mutex;
     PsramPlaybackQueue _playback;
+    size_t _playback_queued_samples = 0;
 };
 
 std::unique_ptr<GeminiLiveClient> gemini_live_client;
