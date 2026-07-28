@@ -15,10 +15,8 @@
 #include <ctime>
 #include <sys/time.h>
 #include <esp_sntp.h>
-#include <atomic>
 
-static std::string _tag           = "Network";
-static bool _is_network_connected = false;
+static std::string _tag = "Network";
 
 static void time_sync_notification_cb(struct timeval* tv)
 {
@@ -46,17 +44,16 @@ void Hal::startSntp()
 
 void Hal::startNetwork(std::function<void(std::string_view)> onLog)
 {
-    if (_is_network_connected) {
+    auto& wifi = WifiManager::GetInstance();
+    if (wifi.IsConnected()) {
         mclog::tagInfo(_tag, "network already connected");
         return;
     }
 
-    std::atomic<bool> network_connected = false;
-
     auto& board = Board::GetInstance();
     mclog::tagInfo(_tag, "start and wait for network connected...");
 
-    board.SetNetworkEventCallback([&network_connected, &onLog](NetworkEvent event, const std::string& data) {
+    board.SetNetworkEventCallback([&onLog](NetworkEvent event, const std::string& data) {
         switch (event) {
             case NetworkEvent::Scanning:
                 if (onLog) {
@@ -75,10 +72,8 @@ void Hal::startNetwork(std::function<void(std::string_view)> onLog)
                 }
                 break;
             }
-            case NetworkEvent::Connected: {
-                network_connected = true;
+            case NetworkEvent::Connected:
                 break;
-            }
             case NetworkEvent::Disconnected:
                 break;
             case NetworkEvent::WifiConfigModeEnter: {
@@ -108,15 +103,13 @@ void Hal::startNetwork(std::function<void(std::string_view)> onLog)
     });
     board.StartNetwork();
 
-    while (!network_connected) {
+    while (!wifi.IsConnected()) {
         GetHAL().delay(500);
     }
     mclog::tagInfo(_tag, "network connected");
     board.SetNetworkEventCallback(nullptr);
 
     startSntp();
-
-    _is_network_connected = true;
 }
 
 WifiStatus Hal::getWifiStatus()

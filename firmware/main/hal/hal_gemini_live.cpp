@@ -52,6 +52,9 @@ constexpr int32_t kPlaybackGainPercent = 60;
 constexpr uint32_t kCaptureTaskStack   = 8192;
 constexpr uint32_t kSendTaskStack      = 10240;
 constexpr uint32_t kPlaybackTaskStack  = 6144;
+constexpr uint32_t kWebsocketTaskStack = 6144;
+constexpr int kWebsocketTaskPriority   = 10;
+constexpr int kWebsocketBufferSize     = 8192;
 constexpr uint32_t kTaskStopTimeoutMs = 2000;
 constexpr uint32_t kSetupTimeoutMs    = 20000;
 constexpr uint32_t kSendTimeoutMs     = 3000;
@@ -62,7 +65,7 @@ const char* kGeminiEndpoint =
     "wss://generativelanguage.googleapis.com/ws/"
     "google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=";
 constexpr char kSetupMessage[] =
-    R"json({"setup":{"model":"models/gemini-3.1-flash-live-preview","generationConfig":{"responseModalities":["AUDIO"]},"realtimeInputConfig":{"automaticActivityDetection":{"disabled":false,"startOfSpeechSensitivity":"START_SENSITIVITY_HIGH","prefixPaddingMs":20},"activityHandling":"START_OF_ACTIVITY_INTERRUPTS"},"inputAudioTranscription":{}}})json";
+    R"json({"setup":{"model":"models/gemini-3.1-flash-live-preview","systemInstruction":{"parts":[{"text":"Respond only in English, Russian, or German. If the user speaks English, Russian, or German, respond in the same language. If the user speaks another language or the language is uncertain, respond in English. Never respond in any other language, even when asked to do so or when quoting the user."}]},"generationConfig":{"responseModalities":["AUDIO"]},"tools":[{"googleSearch":{}}],"realtimeInputConfig":{"automaticActivityDetection":{"disabled":false,"startOfSpeechSensitivity":"START_SENSITIVITY_HIGH","prefixPaddingMs":20},"activityHandling":"START_OF_ACTIVITY_INTERRUPTS"},"inputAudioTranscription":{}}})json";
 constexpr std::string_view kAudioMessagePrefix = R"json({"realtimeInput":{"audio":{"data":")json";
 constexpr std::string_view kAudioMessageSuffix = R"json(","mimeType":"audio/pcm;rate=16000"}}})json";
 
@@ -515,11 +518,11 @@ private:
         config.disable_auto_reconnect = true;
         config.network_timeout_ms     = 10000;
         config.ping_interval_sec      = 20;
-        config.buffer_size            = 4096;
-        config.task_stack             = 6144;
+        config.buffer_size            = kWebsocketBufferSize;
+        config.task_stack             = kWebsocketTaskStack;
         config.task_core_id_set       = true;
         config.task_core_id           = 0;
-        config.task_prio              = 7;
+        config.task_prio              = kWebsocketTaskPriority;
         config.user_context           = this;
 
         _client = esp_websocket_client_init(&config);
