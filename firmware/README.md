@@ -31,7 +31,8 @@ CMake embeds the key in the firmware image and generated files under `build/`;
 it is not committed. Rebuild after rotating the key.
 
 In the app, hold the face to record and stream microphone audio; the body LEDs
-turn green. Release to finish the turn and show the thinking face (amber LEDs).
+turn green. Release to finish the turn and show the processing pet while thinking
+(amber LEDs).
 Playback begins after roughly 350 ms of response audio is buffered, or sooner
 if a shorter reply is complete. The microphone is off while thinking/speaking.
 Presses during thinking are ignored. Pressing during speech immediately cancels
@@ -43,8 +44,8 @@ the turn finishes or is cancelled. Servo limits, stall protection, and automatic
 torque release remain active.
 
 Turns share the same Gemini session and conversation context. Shake the robot
-to discard the session and start a new conversation; the existing dizzy animation
-is preserved. Shake also cancels recording, thinking, or playback. The next press
+to discard the session and start a new conversation; the pet briefly wobbles
+on screen. Shake also cancels recording, thinking, or playback. The next press
 opens a fresh session. Network failures are reported explicitly; retrying after
 a failure starts a new conversation (session resumption is not implemented).
 Google Search grounding is enabled; custom function calls are not configured.
@@ -64,6 +65,25 @@ After flashing, verify press/hold/release (including pressing the eyes and mouth
 follow-up context, ignored presses while thinking, interrupting speech, and shaking
 during each phase. Check that the final syllable is sent before thinking completes
 and that neither interrupted nor pre-shake audio can resume playback.
+
+### Codex pet avatar
+
+`GEMINI.LIVE` displays the DouOS Codex pet on the 320 × 240 screen: **Wave**
+while listening, **Failed** on errors, **Review** while speaking, **Run** while
+thinking, **Waiting** when ready for the next turn, and **Idle** while connecting.
+Shake-to-reset uses a visual wobble, not the source pet's Jump move.
+Servo motion remains paused throughout each
+recording/thinking/speaking turn. Other apps retain the default StackChan face.
+
+To convert another compatible pet from the repository root:
+
+```sh
+uv run firmware/tools/convert_codex_pet.py /path/to/pet.zip
+```
+
+Then rebuild and flash both the firmware and assets with `idf.py flash`.
+See [the converter guide](tools/README.md) for gallery URLs, local directories,
+sizing, animation timings, tests, and artwork attribution.
 
 ### Host-side tests
 

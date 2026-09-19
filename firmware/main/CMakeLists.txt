@@ -448,6 +448,9 @@ function(build_default_assets_bin)
     list(APPEND BUILD_ARGS "--esp_sr_model_path" "${ESP_SR_MODEL_PATH}")
     list(APPEND BUILD_ARGS "--xiaozhi_fonts_path" "${XIAOZHI_FONTS_PATH}")
     
+    file(GLOB_RECURSE DEFAULT_ASSETS_EXTRA_DEPENDS CONFIGURE_DEPENDS
+        "${DEFAULT_ASSETS_EXTRA_FILES}/*")
+
     # Create custom command to build assets
     add_custom_command(
         OUTPUT ${GENERATED_ASSETS_BIN}
@@ -455,6 +458,7 @@ function(build_default_assets_bin)
         DEPENDS
             ${SDKCONFIG}
             ${XIAOZHI_MAIN_DIR}/../scripts/build_default_assets.py
+            ${DEFAULT_ASSETS_EXTRA_DEPENDS}
         COMMENT "Building default assets.bin based on configuration"
         VERBATIM
     )

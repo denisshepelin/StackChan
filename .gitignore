@@ -3,3 +3,5 @@
 firmware/sdkconfig.defaults.local
 .idea/
 firmware/build-host-tests/
+__pycache__/
+*.pyc

@@ -1,0 +1,82 @@
+{
+  "schemaVersion": 1,
+  "pet": {
+    "id": "github-com-isdou-douos",
+    "displayName": "DouOS",
+    "description": "DouOS is an original XiaoDou Codex pet: a warm yellow bean-shaped companion wearing a cozy tiger hood.",
+    "spritesheetPath": "spritesheet.webp"
+  },
+  "sourceUrl": "https://www.codexpets.app/pets/github-com-isdou-douos",
+  "spritesheetSha256": "7ae8e5a3f2194d7fc50d86ee63a8a83f6ecc2c3e5d62b4e3f55c8fbd7a85dd5c",
+  "frameWidth": 160,
+  "frameHeight": 174,
+  "backgroundColor": 1059395,
+  "animations": {
+    "idle": {
+      "file": "gemini_pet_idle.bin",
+      "durationsMs": [
+        280,
+        110,
+        110,
+        140,
+        140,
+        320
+      ]
+    },
+    "wave": {
+      "file": "gemini_pet_wave.bin",
+      "durationsMs": [
+        140,
+        140,
+        140,
+        280
+      ]
+    },
+    "failed": {
+      "file": "gemini_pet_failed.bin",
+      "durationsMs": [
+        140,
+        140,
+        140,
+        140,
+        140,
+        140,
+        140,
+        240
+      ]
+    },
+    "review": {
+      "file": "gemini_pet_review.bin",
+      "durationsMs": [
+        150,
+        150,
+        150,
+        150,
+        150,
+        280
+      ]
+    },
+    "waiting": {
+      "file": "gemini_pet_waiting.bin",
+      "durationsMs": [
+        150,
+        150,
+        150,
+        150,
+        150,
+        260
+      ]
+    },
+    "run": {
+      "file": "gemini_pet_run.bin",
+      "durationsMs": [
+        120,
+        120,
+        120,
+        120,
+        120,
+        220
+      ]
+    }
+  }
+}

@@ -10,6 +10,7 @@
 #include <mooncake_log.h>
 #include <smooth_lvgl.hpp>
 #include <stackchan/stackchan.h>
+#include <stackchan/avatar/skins/codex_pet/codex_pet_avatar.h>
 
 #include <memory>
 
@@ -57,16 +58,9 @@ void AppGeminiLive::onOpen()
     LvglLockGuard lock;
     loading_page.reset();
 
-    auto avatar = std::make_unique<avatar::DefaultAvatar>();
+    auto avatar = std::make_unique<avatar::CodexPetAvatar>();
     avatar->init(lv_screen_active());
-    auto* face_panel = avatar->getPanel()->get();
-    lv_obj_add_flag(face_panel, LV_OBJ_FLAG_PRESS_LOCK);
-    lv_obj_tree_walk(face_panel, [](lv_obj_t* object, void* panel) {
-        if (object != panel) {
-            lv_obj_remove_flag(object, LV_OBJ_FLAG_CLICKABLE);
-        }
-        return LV_OBJ_TREE_WALK_NEXT;
-    }, face_panel);
+    auto* face_panel = avatar->touchPanel();
     lv_obj_add_event_cb(face_panel, [](lv_event_t* event) {
         const auto code = lv_event_get_code(event);
         if (code == LV_EVENT_PRESSED) {
@@ -83,17 +77,12 @@ void AppGeminiLive::onOpen()
     GetStackChan().attachAvatar(std::move(avatar));
 
     auto& stackchan = GetStackChan();
-    stackchan.addModifier(std::make_unique<BreathModifier>());
-    stackchan.addModifier(std::make_unique<BlinkModifier>());
-    stackchan.addModifier(std::make_unique<HeadPetModifier>());
-    stackchan.addModifier(std::make_unique<ImuEventModifier>());
     _imu_connection = GetHAL().onImuMotionEvent.connect([this](ImuMotionEvent event) {
         if (event == ImuMotionEvent::Shake) {
             _conversation_reset_pending = true;
         }
     });
     stackchan.addModifier(std::make_unique<IdleMotionModifier>());
-    stackchan.addModifier(std::make_unique<IdleExpressionModifier>());
 
     view::create_home_indicator([this]() { close(); }, 0xAECBFA, 0x102A43);
     view::create_status_bar(0xAECBFA, 0x102A43);
@@ -103,9 +92,11 @@ void AppGeminiLive::onRunning()
 {
     LvglLockGuard lock;
     auto& stackchan = GetStackChan();
+    auto& face = static_cast<avatar::CodexPetAvatar&>(stackchan.avatar());
 
     if (_conversation_reset_pending.exchange(false)) {
         GetHAL().resetGeminiLiveConversation();
+        face.showConversationReset();
     }
 
     GeminiLiveStatus status;
@@ -125,42 +116,32 @@ void AppGeminiLive::onRunning()
         stackchan.motion().setMotionPaused(status == GeminiLiveStatus::Listening ||
                                           status == GeminiLiveStatus::Thinking ||
                                           status == GeminiLiveStatus::Speaking);
-        auto& face = stackchan.avatar();
-        if (_speaking_modifier_id >= 0 && status != GeminiLiveStatus::Speaking) {
-            stackchan.removeModifier(_speaking_modifier_id);
-            _speaking_modifier_id = -1;
-            face.mouth().setWeight(0);
-        }
-
-        if (status == GeminiLiveStatus::Speaking) {
-            face.clearSpeech();
-            if (_speaking_modifier_id < 0) {
-                _speaking_modifier_id = stackchan.addModifier(std::make_unique<SpeakingModifier>(0, 180, false));
-            }
-        } else {
-            face.setSpeech(message);
-        }
+        face.setErrorMessage(status == GeminiLiveStatus::Error ? message : "");
 
         switch (status) {
             case GeminiLiveStatus::Listening:
                 GetHAL().showRgbColor(0, 50, 0);
-                face.setEmotion(avatar::Emotion::Happy);
+                face.setAnimation(avatar::CodexPetAnimation::Wave);
                 break;
             case GeminiLiveStatus::Thinking:
                 GetHAL().showRgbColor(25, 15, 0);
-                face.setEmotion(avatar::Emotion::Doubt);
+                face.setAnimation(avatar::CodexPetAnimation::Run);
                 break;
             case GeminiLiveStatus::Speaking:
                 GetHAL().showRgbColor(0, 0, 35);
-                face.setEmotion(avatar::Emotion::Happy);
+                face.setAnimation(avatar::CodexPetAnimation::Review);
                 break;
             case GeminiLiveStatus::Error:
                 GetHAL().showRgbColor(0, 0, 0);
-                face.setEmotion(avatar::Emotion::Sad);
+                face.setAnimation(avatar::CodexPetAnimation::Failed);
+                break;
+            case GeminiLiveStatus::Ready:
+                GetHAL().showRgbColor(0, 0, 0);
+                face.setAnimation(avatar::CodexPetAnimation::Waiting);
                 break;
             default:
                 GetHAL().showRgbColor(0, 0, 0);
-                face.setEmotion(avatar::Emotion::Neutral);
+                face.setAnimation(avatar::CodexPetAnimation::Idle);
                 break;
         }
     }

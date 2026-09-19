@@ -30,5 +30,4 @@ private:
     GeminiLiveStatus _pending_status = GeminiLiveStatus::Connecting;
     std::string _pending_message;
     std::mutex _status_mutex;
-    int _speaking_modifier_id = -1;
 };

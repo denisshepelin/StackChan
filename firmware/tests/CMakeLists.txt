@@ -22,6 +22,11 @@ target_include_directories(gemini_turn_state_test PRIVATE ../main)
 target_compile_features(gemini_turn_state_test PRIVATE cxx_std_17)
 add_test(NAME gemini_turn_state_test COMMAND $<TARGET_FILE:gemini_turn_state_test>)
 
+add_executable(codex_pet_animation_test codex_pet_animation_test.cpp)
+target_include_directories(codex_pet_animation_test PRIVATE ../main)
+target_compile_features(codex_pet_animation_test PRIVATE cxx_std_17)
+add_test(NAME codex_pet_animation_test COMMAND $<TARGET_FILE:codex_pet_animation_test>)
+
 set(SMOOTH_UI_TOOLKIT_SRC "${CMAKE_CURRENT_SOURCE_DIR}/../components/smooth_ui_toolkit/src")
 if(EXISTS "${SMOOTH_UI_TOOLKIT_SRC}/smooth_ui_toolkit.hpp")
     file(GLOB_RECURSE SMOOTH_UI_CORE_SOURCES CONFIGURE_DEPENDS "${SMOOTH_UI_TOOLKIT_SRC}/core/*.cpp")
