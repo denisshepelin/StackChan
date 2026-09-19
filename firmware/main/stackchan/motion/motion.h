@@ -156,6 +156,10 @@ public:
     void setAutoTorqueReleaseEnabled(bool enabled);
     void setAutoAngleSyncEnabled(bool enabled);
 
+    // Motion pause is independent of modifier locks; discarded movements do not resume.
+    void setMotionPaused(bool paused);
+    bool isMotionPaused() const;
+
     void setModifyLock(bool locked);
     bool isModifyLocked();
 

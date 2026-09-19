@@ -137,6 +137,7 @@ enum class GeminiLiveStatus {
     Connecting = 0,
     Ready,
     Listening,
+    Thinking,
     Speaking,
     Error,
 };
@@ -312,8 +313,12 @@ public:
     /* ------------------------------ Gemini Live ------------------------------ */
     uitk::Signal<GeminiLiveStatus, const std::string&> onGeminiLiveStatus;
     bool startGeminiLiveService(std::function<void(std::string_view)> onLog);
+    // Push-to-talk press: starts capture, or interrupts playback; ignored while thinking.
     bool startGeminiLiveTurn();
+    // Push-to-talk release: sends activityEnd after the final captured audio.
     void stopGeminiLiveTurn();
+    // Starts a new conversation by discarding the current Gemini session and queued audio.
+    void resetGeminiLiveConversation();
     void stopGeminiLiveService();
 
 private:

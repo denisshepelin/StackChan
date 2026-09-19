@@ -24,8 +24,8 @@ public:
 private:
     void handleStatus(GeminiLiveStatus status, const std::string& message);
 
-    std::atomic<bool> _face_clicked  = false;
-    bool _turn_active                = false;
+    std::atomic<bool> _conversation_reset_pending = false;
+    int _imu_connection = -1;
     bool _status_pending             = false;
     GeminiLiveStatus _pending_status = GeminiLiveStatus::Connecting;
     std::string _pending_message;

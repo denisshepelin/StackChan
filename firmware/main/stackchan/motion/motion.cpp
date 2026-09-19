@@ -126,6 +126,17 @@ void Motion::setAutoAngleSyncEnabled(bool enabled)
     _pitch_servo->setAutoAngleSyncEnabled(enabled);
 }
 
+void Motion::setMotionPaused(bool paused)
+{
+    _yaw_servo->setMotionPaused(paused);
+    _pitch_servo->setMotionPaused(paused);
+}
+
+bool Motion::isMotionPaused() const
+{
+    return _yaw_servo->isMotionPaused() || _pitch_servo->isMotionPaused();
+}
+
 void Motion::setModifyLock(bool locked)
 {
     _is_modify_locked = locked;
@@ -133,5 +144,5 @@ void Motion::setModifyLock(bool locked)
 
 bool Motion::isModifyLocked()
 {
-    return _is_modify_locked;
+    return _is_modify_locked || isMotionPaused();
 }

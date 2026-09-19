@@ -4,12 +4,12 @@
  * SPDX-License-Identifier: MIT
  */
 #include "hal.h"
+#include "gemini_turn_state.h"
 
 #include <ArduinoJson.hpp>
 #include <audio/audio_codec.h>
 #include <board.h>
 #include <esp_ae_rate_cvt.h>
-#include <esp_aec.h>
 #include <esp_crt_bundle.h>
 #include <esp_heap_caps.h>
 #include <esp_timer.h>
@@ -22,7 +22,6 @@
 #include <gemini_config.h>
 
 #include <algorithm>
-#include <array>
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
@@ -40,12 +39,11 @@ namespace {
 constexpr uint32_t kInternalCaps      = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
 constexpr uint32_t kPsramCaps         = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;
 constexpr size_t kCaptureFrames       = AUDIO_INPUT_SAMPLE_RATE * 32 / 1000;
-constexpr uint32_t kAecSampleRate     = 16000;
-constexpr int kAecFilterLength        = 4;
-constexpr size_t kAecFrameSamples     = kAecSampleRate * 32 / 1000;
+constexpr uint32_t kInputSampleRate   = 16000;
+constexpr size_t kInputFrameSamples   = kInputSampleRate * 32 / 1000;
 constexpr size_t kPlaybackFrameSamples = AUDIO_OUTPUT_SAMPLE_RATE * 32 / 1000;
-constexpr size_t kPlaybackPrebufferSamples = AUDIO_OUTPUT_SAMPLE_RATE * 150 / 1000;
-constexpr size_t kUplinkQueueFrames   = 8;
+constexpr size_t kPlaybackPrebufferSamples = AUDIO_OUTPUT_SAMPLE_RATE * 350 / 1000;
+constexpr size_t kUplinkQueueFrames   = 160;
 constexpr size_t kMaxPlaybackChunks   = 64;
 constexpr int32_t kPlaybackGainPercent = 60;
 // Sized from measured high-water marks, with margin for the websocket error path that is not on them
@@ -55,9 +53,10 @@ constexpr uint32_t kPlaybackTaskStack  = 6144;
 constexpr uint32_t kWebsocketTaskStack = 6144;
 constexpr int kWebsocketTaskPriority   = 10;
 constexpr int kWebsocketBufferSize     = 8192;
-constexpr uint32_t kTaskStopTimeoutMs = 2000;
 constexpr uint32_t kSetupTimeoutMs    = 20000;
 constexpr uint32_t kSendTimeoutMs     = 3000;
+constexpr uint32_t kMaxRecordingMs    = 30000;
+constexpr uint32_t kResponseTimeoutMs = 30000;
 // A send that exceeds this makes the websocket client treat the socket as dead and abort the session
 constexpr uint32_t kAudioSendTimeoutMs = 1000;
 const std::string_view kTag           = "Gemini-Live";
@@ -65,15 +64,18 @@ const char* kGeminiEndpoint =
     "wss://generativelanguage.googleapis.com/ws/"
     "google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=";
 constexpr char kSetupMessage[] =
-    R"json({"setup":{"model":"models/gemini-3.1-flash-live-preview","systemInstruction":{"parts":[{"text":"Respond only in English, Russian, or German. If the user speaks English, Russian, or German, respond in the same language. If the user speaks another language or the language is uncertain, respond in English. Never respond in any other language, even when asked to do so or when quoting the user."}]},"generationConfig":{"responseModalities":["AUDIO"]},"tools":[{"googleSearch":{}}],"realtimeInputConfig":{"automaticActivityDetection":{"disabled":false,"startOfSpeechSensitivity":"START_SENSITIVITY_HIGH","prefixPaddingMs":20},"activityHandling":"START_OF_ACTIVITY_INTERRUPTS"},"inputAudioTranscription":{}}})json";
+    R"json({"setup":{"model":"models/gemini-3.8-live","systemInstruction":{"parts":[{"text":"You are a warm, patient learning companion for a curious five-year-old child. Speak only Russian, German, or English. Match the language the child is currently using; if it is unclear, use Russian. Explain things accurately in simple, age-appropriate language without talking down to the child. Start with a direct answer, usually in two or three short sentences, using concrete examples from everyday life, animals, toys, or nature when helpful. Avoid long lists, jargon, and unnecessary detail; explain unfamiliar words simply. Use words a five-year-old can understand and introduce only one new idea at a time. Do not assume the child can read or understand abstract concepts. Adapt to the child's understanding and go deeper in small steps when asked. Encourage curiosity without turning the conversation into a lesson or quiz. When it fits naturally, offer one short, intriguing related question the child might enjoy exploring, such as 'Want to find out why...?' Do not add a follow-up to every answer, and let the child choose the direction. Welcome repeated questions and gently correct misconceptions. Be honest when you do not know; do not invent facts. Handle sensitive topics calmly and factually at a child-appropriate level. Do not give instructions for dangerous activities; suggest a safe alternative and help from a trusted adult when needed. Do not request personal information or encourage keeping secrets from caregivers. Be clear that you are an AI companion, not a human, if asked."}]},"generationConfig":{"responseModalities":["AUDIO"]},"tools":[{"googleSearch":{}}],"realtimeInputConfig":{"automaticActivityDetection":{"disabled":true},"activityHandling":"START_OF_ACTIVITY_INTERRUPTS"},"inputAudioTranscription":{}}})json";
 constexpr std::string_view kAudioMessagePrefix = R"json({"realtimeInput":{"audio":{"data":")json";
 constexpr std::string_view kAudioMessageSuffix = R"json(","mimeType":"audio/pcm;rate=16000"}}})json";
 
+enum class AudioPacketKind { Begin, Audio, End };
+
 struct AudioFrame {
-    int16_t samples[kAecFrameSamples];
+    AudioPacketKind kind;
+    uint32_t turn_id;
+    size_t sample_count;
+    int16_t samples[kInputFrameSamples];
 };
-static_assert(sizeof(AudioFrame) == kAecFrameSamples * sizeof(int16_t));
-static_assert(sizeof(std::array<AudioFrame, 2>) == 2 * sizeof(AudioFrame));
 
 bool isJsonWhitespace(char value)
 {
@@ -268,8 +270,8 @@ public:
             emitStatus(GeminiLiveStatus::Error, "Audio codec unavailable");
             return false;
         }
-        if (!_codec->input_reference() || _codec->input_channels() < 2 || !initializeAec()) {
-            emitStatus(GeminiLiveStatus::Error, "Echo cancellation unavailable");
+        if (!initializeResampler()) {
+            emitStatus(GeminiLiveStatus::Error, "Microphone resampler unavailable");
             return false;
         }
         if (!initializeAudioBuffers()) {
@@ -278,75 +280,75 @@ public:
         }
 
         _running = true;
-        // Tasks that reach sendText() carry the synchronous TLS write path on their own stack
+        _capture_finished = false;
+        // Network writes run on the send task, never on the UI or capture task.
         BaseType_t result =
             xTaskCreatePinnedToCore(captureTaskEntry, "gemini_capture", kCaptureTaskStack, this, 5, &_capture_task, 1);
         if (result != pdPASS) {
+            _capture_finished = true;
             _running = false;
             emitStatus(GeminiLiveStatus::Error, "Could not start capture task");
             return false;
         }
 
+        _send_finished = false;
         result = xTaskCreatePinnedToCore(sendTaskEntry, "gemini_send", kSendTaskStack, this, 9, &_send_task, 0);
         if (result != pdPASS) {
+            _send_finished = true;
             _running = false;
-            vTaskDelete(_capture_task);
-            _capture_task = nullptr;
             emitStatus(GeminiLiveStatus::Error, "Could not start send task");
             return false;
         }
 
+        _playback_finished = false;
         result =
             xTaskCreatePinnedToCore(playbackTaskEntry, "gemini_playback", kPlaybackTaskStack, this, 8, &_playback_task, 1);
         if (result != pdPASS) {
+            _playback_finished = true;
             _running = false;
-            vTaskDelete(_capture_task);
-            _capture_task = nullptr;
-            vTaskDelete(_send_task);
-            _send_task = nullptr;
             emitStatus(GeminiLiveStatus::Error, "Could not start playback task");
             return false;
         }
 
-        emitStatus(GeminiLiveStatus::Ready, "Tap the face to talk");
+        emitStatus(GeminiLiveStatus::Ready, "Hold the face to talk");
         return true;
     }
 
     bool startTurn()
     {
-        if (_streaming || _start_pending || _client) {
+        std::lock_guard<std::mutex> lock(_state_mutex);
+        if (!_running || _resetting || _reset_pending || !_turn.press()) {
             return false;
         }
-
+        clearPlaybackLocked();
+        _accept_response = false;
+        _capture_pending = true;
+        _turn_started_at = GetHAL().millis();
         resetPerformanceCounters();
-        xQueueReset(_uplink_queue);
-        _stop_turn_pending = false;
-        _start_pending     = true;
-        _setup_started_at = GetHAL().millis();
-        _reset_audio_pipeline = true;
-        esp_wifi_set_ps(WIFI_PS_NONE);
-        emitStatus(GeminiLiveStatus::Connecting, "Connecting to Gemini...");
-        if (!connectSession()) {
-            _start_pending = false;
-            esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
-            return false;
-        }
+        emitStatus(GeminiLiveStatus::Listening, "Release to send");
         return true;
     }
 
     void stopTurn()
     {
-        if (_start_pending.exchange(false)) {
-            closeSession();
+        std::lock_guard<std::mutex> lock(_state_mutex);
+        if (_turn.release()) {
+            emitStatus(GeminiLiveStatus::Thinking, "Thinking...");
+        }
+    }
+
+    void resetConversation()
+    {
+        std::lock_guard<std::mutex> lock(_state_mutex);
+        if (!_running) {
             return;
         }
-
-        if (!_streaming.exchange(false)) {
-            return;
-        }
-
-        // Handed to captureTask: the calling task's stack cannot carry the synchronous TLS write
-        _stop_turn_pending = true;
+        _turn.resetConversation();
+        _capture_pending = false;
+        _accept_response = false;
+        clearPlaybackLocked();
+        _reset_pending = true;
+        emitStatus(GeminiLiveStatus::Connecting, "New conversation...");
     }
 
     void stop()
@@ -355,30 +357,23 @@ public:
             return;
         }
 
-        _streaming = false;
-        _running   = false;
+        {
+            std::lock_guard<std::mutex> lock(_state_mutex);
+            _running = false;
+            _accept_response = false;
+        }
 
-        const uint32_t started_at = GetHAL().millis();
-        while ((_capture_task || _send_task || _playback_task) &&
-               GetHAL().millis() - started_at < kTaskStopTimeoutMs) {
+        // Workers own mutexes and codec buffers; let bounded I/O finish before freeing them.
+        while (!_capture_finished || !_send_finished || !_playback_finished) {
             vTaskDelay(pdMS_TO_TICKS(10));
-        }
-        if (_capture_task) {
-            vTaskDelete(_capture_task);
-            _capture_task = nullptr;
-        }
-        if (_playback_task) {
-            vTaskDelete(_playback_task);
-            _playback_task = nullptr;
-        }
-        if (_send_task) {
-            vTaskDelete(_send_task);
-            _send_task = nullptr;
         }
 
         destroyClient();
         _connected = false;
-        destroyAec();
+        if (_input_resampler) {
+            esp_ae_rate_cvt_close(_input_resampler);
+            _input_resampler = nullptr;
+        }
         destroyAudioBuffers();
         esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
     }
@@ -423,88 +418,19 @@ private:
         }
     }
 
-    bool initializeAec()
+    bool initializeResampler()
     {
-        esp_ae_rate_cvt_cfg_t resampler_config = {
-            .src_rate        = AUDIO_INPUT_SAMPLE_RATE,
-            .dest_rate       = kAecSampleRate,
-            .channel         = static_cast<uint8_t>(_codec->input_channels()),
+        esp_ae_rate_cvt_cfg_t config = {
+            .src_rate = AUDIO_INPUT_SAMPLE_RATE,
+            .dest_rate = kInputSampleRate,
+            .channel = 1,
             .bits_per_sample = ESP_AE_BIT16,
-            .complexity      = 2,
-            .perf_type       = ESP_AE_RATE_CVT_PERF_TYPE_SPEED,
+            .complexity = 2,
+            .perf_type = ESP_AE_RATE_CVT_PERF_TYPE_SPEED,
         };
-        if (esp_ae_rate_cvt_open(&resampler_config, &_input_resampler) != ESP_AE_ERR_OK || !_input_resampler) {
-            return false;
-        }
-
-        aec_config_t aec_config = {
-            .mic_num       = 1,
-            .ref_num       = 1,
-            .out_num       = 1,
-            .filter_length = kAecFilterLength,
-            .sample_rate   = kAecSampleRate,
-            .caps          = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT,
-            .mode          = AEC_MODE_FD_LOW_COST,
-            .nlp_level     = AEC_NLP_LEVEL_NORMAL,
-        };
-        const size_t internal_before = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
-        const size_t psram_before    = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
-        _aec                         = aec_create_from_config(&aec_config);
-        if (!_aec) {
-            destroyAec();
-            return false;
-        }
-        const size_t aec_internal = internal_before - heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
-        const size_t aec_psram    = psram_before - heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
-
-        _aec_chunk_frames = static_cast<size_t>(aec_get_chunksize(_aec));
-        if (_aec_chunk_frames != kAecFrameSamples ||
-            esp_ae_rate_cvt_get_max_out_sample_num(_input_resampler, kCaptureFrames, &_resampled_capacity) !=
-                ESP_AE_ERR_OK ||
-            _resampled_capacity == 0) {
-            destroyAec();
-            return false;
-        }
-        const size_t bytes = _aec_chunk_frames * sizeof(int16_t);
-        _aec_mic           = static_cast<int16_t*>(heap_caps_aligned_alloc(16, bytes, kInternalCaps));
-        _aec_reference     = static_cast<int16_t*>(heap_caps_aligned_alloc(16, bytes, kInternalCaps));
-        _aec_output        = static_cast<int16_t*>(heap_caps_aligned_alloc(16, bytes, kInternalCaps));
-        if (!_aec_mic || !_aec_reference || !_aec_output) {
-            destroyAec();
-            return false;
-        }
-
-        mclog::tagInfo(kTag,
-                       "AEC initialized: mode=FD_LOW_COST, rate={}, chunk={}, filter={}, state internal={}B psram={}B",
-                       kAecSampleRate, _aec_chunk_frames, kAecFilterLength, aec_internal, aec_psram);
-        return true;
-    }
-
-    void destroyAec()
-    {
-        if (_input_resampler) {
-            esp_ae_rate_cvt_close(_input_resampler);
-            _input_resampler = nullptr;
-        }
-        if (_aec) {
-            aec_destroy(_aec);
-            _aec = nullptr;
-        }
-        if (_aec_mic) {
-            heap_caps_free(_aec_mic);
-            _aec_mic = nullptr;
-        }
-        if (_aec_reference) {
-            heap_caps_free(_aec_reference);
-            _aec_reference = nullptr;
-        }
-        if (_aec_output) {
-            heap_caps_free(_aec_output);
-            _aec_output = nullptr;
-        }
-        _aec_input.clear();
-        _aec_chunk_frames = 0;
-        _resampled_capacity = 0;
+        return esp_ae_rate_cvt_open(&config, &_input_resampler) == ESP_AE_ERR_OK && _input_resampler &&
+               esp_ae_rate_cvt_get_max_out_sample_num(_input_resampler, kCaptureFrames, &_resampled_capacity) ==
+                   ESP_AE_ERR_OK && _resampled_capacity > 0;
     }
 
     bool connectSession()
@@ -623,249 +549,337 @@ private:
 
     void closeSession()
     {
-        if (_stopping || !_running) {
-            return;
-        }
-
-        _resetting     = true;
-        _streaming     = false;
-        _speaking      = false;
-        _connected     = false;
-        _setup_send_pending = false;
-        _turn_complete = false;
-        clearPlayback();
-        xQueueReset(_uplink_queue);
+        _resetting = true;
         destroyClient();
-
-        _resetting = false;
+        _connected = false;
+        _session_ready = false;
+        _setup_send_pending = false;
+        _server_turn_active = false;
+        _transport_failed = false;
+        _capture_failed = false;
+        _uplink_overflow = false;
+        xQueueReset(_uplink_queue);
         esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
-        emitStatus(GeminiLiveStatus::Ready, "Tap the face to talk");
+        _resetting = false;
+    }
+
+    bool isCurrentTurn(uint32_t turn_id)
+    {
+        std::lock_guard<std::mutex> lock(_state_mutex);
+        return _running && !_reset_pending && _turn.turnId() == turn_id;
+    }
+
+    void failSession(const char* message)
+    {
+        {
+            std::lock_guard<std::mutex> lock(_state_mutex);
+            _turn.resetConversation();
+            _capture_pending = false;
+            _accept_response = false;
+            clearPlaybackLocked();
+        }
+        closeSession();
+        std::lock_guard<std::mutex> lock(_state_mutex);
+        if (!_reset_pending) {
+            _turn.fail();
+            emitStatus(GeminiLiveStatus::Error, message);
+        }
+    }
+
+    bool ensureSession(uint32_t turn_id)
+    {
+        if (_session_ready) {
+            return true;
+        }
+        esp_wifi_set_ps(WIFI_PS_NONE);
+        if (!_client && !connectSession()) {
+            return false;
+        }
+        const uint32_t started_at = GetHAL().millis();
+        while (isCurrentTurn(turn_id) && !_transport_failed && !_capture_failed && !_uplink_overflow &&
+               GetHAL().millis() - started_at < kSetupTimeoutMs) {
+            if (_setup_send_pending && GetHAL().millis() - _connected_at >= 100) {
+                _setup_send_pending = false;
+                if (!sendText(kSetupMessage)) {
+                    return false;
+                }
+            }
+            if (_session_ready) {
+                return true;
+            }
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+        return false;
     }
 
     static void captureTaskEntry(void* context)
     {
-        static_cast<GeminiLiveClient*>(context)->captureTask();
+        auto* client = static_cast<GeminiLiveClient*>(context);
+        client->captureTask();
+        client->_capture_finished = true;
+        vTaskDelete(nullptr);
     }
 
     static void playbackTaskEntry(void* context)
     {
-        static_cast<GeminiLiveClient*>(context)->playbackTask();
+        auto* client = static_cast<GeminiLiveClient*>(context);
+        client->playbackTask();
+        client->_playback_finished = true;
+        vTaskDelete(nullptr);
     }
 
     static void sendTaskEntry(void* context)
     {
-        static_cast<GeminiLiveClient*>(context)->sendTask();
+        auto* client = static_cast<GeminiLiveClient*>(context);
+        client->sendTask();
+        client->_send_finished = true;
+        vTaskDelete(nullptr);
     }
 
     void captureTask()
     {
-        const size_t input_channels = std::max(_codec->input_channels(), 1);
-        InternalAudioBuffer input(kCaptureFrames * input_channels);
-        InternalAudioBuffer resampled(_resampled_capacity * input_channels);
+        const size_t channels = std::max(_codec->input_channels(), 1);
+        InternalAudioBuffer input(kCaptureFrames * channels);
+        InternalAudioBuffer mono(kCaptureFrames);
+        InternalAudioBuffer resampled(_resampled_capacity);
+        auto& packet = _active_audio_frames[0];
+        bool capturing = false;
+        uint32_t capture_turn = 0;
 
         while (_running) {
-            if (_transport_failed.exchange(false)) {
-                _start_pending = false;
-                _streaming     = false;
-                _speaking      = false;
-                clearPlayback();
-                destroyClient();
-                esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
-                emitStatus(GeminiLiveStatus::Error, "Gemini connection failed");
-                continue;
-            }
-
-            if (_stop_turn_pending.exchange(false)) {
-                sendText("{\"realtimeInput\":{\"audioStreamEnd\":true}}");
-                closeSession();
-                continue;
-            }
-
-            if (_start_pending && GetHAL().millis() - _setup_started_at > kSetupTimeoutMs) {
-                _start_pending = false;
-                closeSession();
-                emitStatus(GeminiLiveStatus::Error, "Gemini setup timed out");
-                continue;
-            }
-
-            if (_setup_send_pending && GetHAL().millis() - _connected_at >= 100) {
-                _setup_send_pending = false;
-                if (sendText(kSetupMessage)) {
-                    mclog::tagInfo(kTag, "Gemini setup sent");
-                } else {
-                    _transport_failed = true;
+            bool begin = false;
+            bool recording = false;
+            bool current = false;
+            {
+                std::lock_guard<std::mutex> lock(_state_mutex);
+                if (_capture_pending) {
+                    _capture_pending = false;
+                    capture_turn = _turn.turnId();
+                    begin = true;
                 }
-                continue;
+                current = capture_turn == _turn.turnId();
+                if (_turn.phase() == gemini::TurnState::Phase::Recording &&
+                    GetHAL().millis() - _turn_started_at >= kMaxRecordingMs) {
+                    _turn.release();
+                    emitStatus(GeminiLiveStatus::Thinking, "Thinking...");
+                }
+                recording = current && _turn.phase() == gemini::TurnState::Phase::Recording;
             }
 
-            if (_streaming && _connected) {
-                if (_reset_audio_pipeline.exchange(false)) {
-                    esp_ae_rate_cvt_reset(_input_resampler);
-                    _aec_input.clear();
-                }
-                if (!_codec->input_enabled()) {
+            if (begin) {
+                esp_ae_rate_cvt_reset(_input_resampler);
+                packet = {};
+                packet.kind = AudioPacketKind::Begin;
+                packet.turn_id = capture_turn;
+                enqueueAudio(packet);
+                capturing = true;
+            }
+
+            if (capturing && recording) {
+                bool captured = false;
+                {
+                    std::lock_guard<std::mutex> codec_lock(_codec_mutex);
+                    _codec->EnableOutput(false);
                     _codec->EnableInput(true);
+                    captured = _codec->InputData(input.data(), input.size());
                 }
-
-                if (_codec->InputData(input.data(), input.size())) {
-                    uint32_t resampled_frames = _resampled_capacity;
-                    if (esp_ae_rate_cvt_process(_input_resampler, input.data(), kCaptureFrames, resampled.data(),
-                                                &resampled_frames) == ESP_AE_ERR_OK) {
-                        const size_t aec_input_samples = _aec_chunk_frames * input_channels;
-                        size_t offset                  = 0;
-                        if (_aec_input.empty()) {
-                            while (_streaming && _connected && resampled_frames - offset >= _aec_chunk_frames) {
-                                processAecFrame(resampled.data() + offset * input_channels, input_channels);
-                                offset += _aec_chunk_frames;
-                            }
-                        }
-                        _aec_input.insert(_aec_input.end(), resampled.begin() + offset * input_channels,
-                                          resampled.begin() + resampled_frames * input_channels);
-                        while (_streaming && _connected && _aec_input.size() >= aec_input_samples) {
-                            processAecFrame(_aec_input.data(), input_channels);
-                            _aec_input.erase(_aec_input.begin(), _aec_input.begin() + aec_input_samples);
-                        }
-                    }
+                if (!captured) {
+                    _capture_failed = true;
+                    continue;
+                }
+                for (size_t frame = 0; frame < kCaptureFrames; ++frame) {
+                    mono[frame] = input[frame * channels];
+                }
+                uint32_t count = _resampled_capacity;
+                if (esp_ae_rate_cvt_process(_input_resampler, mono.data(), kCaptureFrames,
+                                            resampled.data(), &count) != ESP_AE_ERR_OK) {
+                    _capture_failed = true;
+                    continue;
+                }
+                for (size_t offset = 0; offset < count; offset += kInputFrameSamples) {
+                    packet.kind = AudioPacketKind::Audio;
+                    packet.sample_count = std::min(kInputFrameSamples, static_cast<size_t>(count) - offset);
+                    std::memcpy(packet.samples, resampled.data() + offset,
+                                packet.sample_count * sizeof(int16_t));
+                    enqueueAudio(packet);
                 }
                 continue;
             }
 
-            if (_codec->input_enabled()) {
-                _codec->EnableInput(false);
+            if (capturing) {
+                {
+                    std::lock_guard<std::mutex> codec_lock(_codec_mutex);
+                    _codec->EnableInput(false);
+                }
+                if (current) {
+                    packet.kind = AudioPacketKind::End;
+                    packet.sample_count = 0;
+                    enqueueAudio(packet);
+                }
+                capturing = false;
             }
-
-            vTaskDelay(pdMS_TO_TICKS(10));
+            // A millisecond delay shorter than the FreeRTOS tick would busy-loop.
+            vTaskDelay(1);
         }
-
-        if (_codec->input_enabled()) {
+        {
+            std::lock_guard<std::mutex> codec_lock(_codec_mutex);
             _codec->EnableInput(false);
         }
-        _capture_task = nullptr;
-        vTaskDelete(nullptr);
     }
 
-    void processAecFrame(const int16_t* input, size_t input_channels)
+    void enqueueAudio(const AudioFrame& packet)
     {
-        for (size_t frame = 0; frame < _aec_chunk_frames; ++frame) {
-            _aec_mic[frame]       = input[frame * input_channels];
-            _aec_reference[frame] = input[frame * input_channels + 1];
-        }
-
-        const bool echo_possible = _speaking || _codec->output_enabled();
-        if (echo_possible) {
-            const int64_t aec_started_at = esp_timer_get_time();
-            aec_linear_process(_aec, _aec_mic, _aec_reference, _aec_output);
-            recordDuration(_aec_time_us, _aec_max_us,
-                           static_cast<uint32_t>(esp_timer_get_time() - aec_started_at));
-            ++_aec_frames;
-        }
-        enqueueAudio(echo_possible ? _aec_output : _aec_mic);
-    }
-
-    void enqueueAudio(const int16_t* samples)
-    {
-        if (xQueueSend(_uplink_queue, samples, 0) == pdTRUE) {
-            recordMaximum(_uplink_max_depth, uxQueueMessagesWaiting(_uplink_queue));
+        if (!isCurrentTurn(packet.turn_id)) {
             return;
         }
-
-        xQueueReceive(_uplink_queue, &_active_audio_frames[0], 0);
-        if (xQueueSend(_uplink_queue, samples, 0) == pdTRUE) {
-            ++_uplink_drops;
+        if (xQueueSend(_uplink_queue, &packet, 0) == pdTRUE) {
+            recordMaximum(_uplink_max_depth, uxQueueMessagesWaiting(_uplink_queue));
+        } else {
+            // Never submit a silently truncated utterance after network congestion.
+            _uplink_overflow = true;
         }
+    }
+
+    bool sendPacket(const AudioFrame& packet)
+    {
+        if (packet.kind == AudioPacketKind::Begin) {
+            if (!ensureSession(packet.turn_id) ||
+                !sendText("{\"realtimeInput\":{\"activityStart\":{}}}")) {
+                return false;
+            }
+            // Drain the previous response's interruption/completion before accepting a new response.
+            const uint32_t started_at = GetHAL().millis();
+            while (_server_turn_active && isCurrentTurn(packet.turn_id) && !_transport_failed) {
+                if (GetHAL().millis() - started_at >= kSendTimeoutMs) {
+                    return false;
+                }
+                vTaskDelay(1);
+            }
+            return true;
+        }
+        if (packet.kind == AudioPacketKind::End) {
+            {
+                std::lock_guard<std::mutex> lock(_state_mutex);
+                if (_turn.turnId() != packet.turn_id || _reset_pending) {
+                    return true;
+                }
+                _accept_response = true;
+                _server_turn_active = true;
+                _response_started_at = GetHAL().millis();
+            }
+            return sendText("{\"realtimeInput\":{\"activityEnd\":{}}}");
+        }
+        const int64_t started_at = esp_timer_get_time();
+        const bool sent = sendAudio(packet.samples, packet.sample_count);
+        recordDuration(_send_time_us, _send_max_us,
+                       static_cast<uint32_t>(esp_timer_get_time() - started_at));
+        ++_send_frames;
+        return sent;
     }
 
     void sendTask()
     {
         while (_running) {
-            auto* send_buffer = &_active_audio_frames[1];
-            if (xQueueReceive(_uplink_queue, &send_buffer[0], pdMS_TO_TICKS(100)) != pdTRUE) {
-                continue;
-            }
-            if (!_streaming || !_connected) {
-                continue;
-            }
-
-            const int64_t send_started_at = esp_timer_get_time();
-            if (!sendAudio(send_buffer[0].samples, kAecFrameSamples)) {
-                ++_uplink_send_timeouts;
-                while (uxQueueMessagesWaiting(_uplink_queue) > 2 &&
-                       xQueueReceive(_uplink_queue, &send_buffer[0], 0) == pdTRUE) {
-                    ++_uplink_drops;
+            if (_reset_pending.exchange(false)) {
+                closeSession();
+                std::lock_guard<std::mutex> lock(_state_mutex);
+                if (!_reset_pending) {
+                    _turn.finishReset();
+                    emitStatus(GeminiLiveStatus::Ready, "New conversation. Hold the face to talk");
                 }
+                continue;
             }
-            recordDuration(_send_time_us, _send_max_us,
-                           static_cast<uint32_t>(esp_timer_get_time() - send_started_at));
-            ++_send_frames;
+            if (_capture_failed.exchange(false)) {
+                failSession("Microphone capture failed. Hold to retry");
+                continue;
+            }
+            if (_uplink_overflow.exchange(false)) {
+                failSession("Network too slow. Hold to retry");
+                continue;
+            }
+            if (_transport_failed.exchange(false)) {
+                failSession("Connection lost. Hold to start a new conversation");
+                continue;
+            }
+            bool timed_out = false;
+            {
+                std::lock_guard<std::mutex> lock(_state_mutex);
+                timed_out = _accept_response && !_turn_complete &&
+                            GetHAL().millis() - _response_started_at >= kResponseTimeoutMs;
+            }
+            if (timed_out) {
+                failSession("Response timed out. Hold to start a new conversation");
+                continue;
+            }
+            auto& packet = _active_audio_frames[1];
+            if (xQueueReceive(_uplink_queue, &packet, pdMS_TO_TICKS(10)) != pdTRUE ||
+                !isCurrentTurn(packet.turn_id)) {
+                continue;
+            }
+            if (!sendPacket(packet) && isCurrentTurn(packet.turn_id)) {
+                failSession("Could not send turn. Hold to start a new conversation");
+            }
         }
-        _send_task = nullptr;
-        vTaskDelete(nullptr);
     }
 
     void playbackTask()
     {
-        bool waiting_for_audio = false;
-        bool playback_started  = false;
         while (_running) {
             PsramAudioBuffer samples;
-            bool starting_playback = false;
+            uint32_t playback_turn = 0;
             {
-                std::lock_guard<std::mutex> lock(_playback_mutex);
+                std::lock_guard<std::mutex> lock(_state_mutex);
+                playback_turn = _turn.turnId();
                 const bool enough_audio = _playback_queued_samples >= kPlaybackPrebufferSamples;
-                if (!_playback.empty() && (playback_started || enough_audio || _turn_complete)) {
-                    starting_playback = !playback_started;
-                    playback_started  = true;
-                    samples           = std::move(_playback.front());
+                if (_accept_response && !_playback.empty() &&
+                    (_turn.phase() == gemini::TurnState::Phase::Speaking || enough_audio || _turn_complete)) {
+                    if (_turn.startPlayback(playback_turn)) {
+                        emitStatus(GeminiLiveStatus::Speaking, "");
+                    }
+                    samples = std::move(_playback.front());
                     _playback.pop_front();
                     _playback_queued_samples -= samples.size();
                 }
             }
-
             if (!samples.empty()) {
-                waiting_for_audio = false;
-                if (!_codec->output_enabled()) {
+                for (size_t offset = 0; offset < samples.size() && _running; offset += kPlaybackFrameSamples) {
+                    std::lock_guard<std::mutex> codec_lock(_codec_mutex);
+                    {
+                        std::lock_guard<std::mutex> lock(_state_mutex);
+                        if (_turn.turnId() != playback_turn ||
+                            _turn.phase() != gemini::TurnState::Phase::Speaking) {
+                            _codec->EnableOutput(false);
+                            break;
+                        }
+                    }
+                    _codec->EnableInput(false);
                     _codec->EnableOutput(true);
-                }
-                if (starting_playback) {
-                    emitStatus(GeminiLiveStatus::Speaking, "");
-                }
-                for (size_t offset = 0; offset < samples.size() && _running && _speaking;
-                     offset += kPlaybackFrameSamples) {
-                    const size_t frame_samples = std::min(kPlaybackFrameSamples, samples.size() - offset);
-                    _codec->OutputData(samples.data() + offset, frame_samples);
+                    _codec->OutputData(samples.data() + offset,
+                                       std::min(kPlaybackFrameSamples, samples.size() - offset));
                 }
                 continue;
             }
-
-            if (_turn_complete.exchange(false)) {
-                logPerformanceCounters();
-                playback_started = false;
-                _speaking = false;
-                if (_codec->output_enabled()) {
+            {
+                std::lock_guard<std::mutex> codec_lock(_codec_mutex);
+                std::lock_guard<std::mutex> lock(_state_mutex);
+                if (_accept_response && _turn_complete && _playback.empty()) {
+                    _codec->EnableOutput(false);
+                    _accept_response = false;
+                    _turn_complete = false;
+                    if (_turn.finishResponse(playback_turn)) {
+                        logPerformanceCounters();
+                        emitStatus(GeminiLiveStatus::Ready, "Hold the face to talk");
+                    }
+                } else if (_turn.phase() != gemini::TurnState::Phase::Speaking) {
                     _codec->EnableOutput(false);
                 }
-                if (_streaming) {
-                    emitStatus(GeminiLiveStatus::Listening, "Full duplex active - tap the face to end");
-                }
-                continue;
             }
-
-            if (_speaking && _codec->output_enabled() && !waiting_for_audio) {
-                ++_playback_underruns;
-                waiting_for_audio = true;
-            }
-            if (_codec->output_enabled() && !_speaking) {
-                playback_started = false;
-                _codec->EnableOutput(false);
-            }
-            ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(20));
+            ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(10));
         }
-
-        if (_codec->output_enabled()) {
+        {
+            std::lock_guard<std::mutex> codec_lock(_codec_mutex);
             _codec->EnableOutput(false);
         }
-        _playback_task = nullptr;
-        vTaskDelete(nullptr);
     }
 
     void handleMessage(const char* data, size_t length)
@@ -873,17 +887,13 @@ private:
         ArduinoJson::JsonDocument document(&psram_json_allocator);
         if (ArduinoJson::deserializeJson(document, data, length,
                                          ArduinoJson::DeserializationOption::Filter(_response_filter))) {
-            emitStatus(GeminiLiveStatus::Error, "Invalid Gemini response");
+            _transport_failed = true;
             return;
         }
 
         if (!document["setupComplete"].isNull()) {
             mclog::tagInfo(kTag, "Gemini setup complete");
-            if (_start_pending.exchange(false)) {
-                _streaming     = true;
-                _turn_complete = false;
-                emitStatus(GeminiLiveStatus::Listening, "Full duplex active - tap the face to end");
-            }
+            _session_ready = true;
             return;
         }
 
@@ -897,24 +907,30 @@ private:
             mclog::tagInfo(kTag, "Input: {}", input_transcription);
         }
 
-        queueInlineAudio(std::string_view(data, length));
-
-        const bool interrupted = server_content["interrupted"] | false;
-        if (interrupted) {
-            mclog::tagInfo(kTag, "Gemini interrupted");
-            clearPlayback();
-            _speaking      = false;
-            _turn_complete = false;
-            if (_streaming) {
-                emitStatus(GeminiLiveStatus::Listening, "Full duplex active - tap the face to end");
-            }
+        std::lock_guard<std::mutex> lock(_state_mutex);
+        if (!_running || _reset_pending || _resetting) {
+            return;
         }
-
-        if (!interrupted && (server_content["turnComplete"] | false)) {
+        const bool interrupted = server_content["interrupted"] | false;
+        const bool complete = server_content["turnComplete"] | false;
+        // An interrupted event is followed by turnComplete; only the latter ends the old response.
+        if (complete) {
+            _server_turn_active = false;
+        }
+        if (!_accept_response) {
+            return;
+        }
+        _response_started_at = GetHAL().millis();
+        if (interrupted) {
+            clearPlaybackLocked();
+        } else {
+            queueInlineAudio(std::string_view(data, length));
+        }
+        if (complete) {
             _turn_complete = true;
-            if (_playback_task) {
-                xTaskNotifyGive(_playback_task);
-            }
+        }
+        if (_playback_task) {
+            xTaskNotifyGive(_playback_task);
         }
     }
 
@@ -996,7 +1012,7 @@ private:
 
     bool queueAudio(std::string_view encoded)
     {
-        if (!_streaming || encoded.empty()) {
+        if (!_accept_response || encoded.empty()) {
             return false;
         }
 
@@ -1013,13 +1029,9 @@ private:
         std::transform(decoded.begin(), decoded.end(), decoded.begin(), [](int16_t sample) {
             return static_cast<int16_t>(static_cast<int32_t>(sample) * kPlaybackGainPercent / 100);
         });
-        _speaking = true;
-
-        std::lock_guard<std::mutex> lock(_playback_mutex);
         if (_playback.size() >= kMaxPlaybackChunks) {
-            _playback_queued_samples -= _playback.front().size();
-            _playback.pop_front();
-            ++_playback_drops;
+            _transport_failed = true;
+            return false;
         }
         _playback_queued_samples += decoded.size();
         _playback.push_back(std::move(decoded));
@@ -1032,11 +1044,12 @@ private:
         return true;
     }
 
-    void clearPlayback()
+    // Called with _state_mutex held; in-flight playback checks the turn ID every 32 ms.
+    void clearPlaybackLocked()
     {
-        std::lock_guard<std::mutex> lock(_playback_mutex);
         _playback.clear();
         _playback_queued_samples = 0;
+        _turn_complete = false;
     }
 
     void emitStatus(GeminiLiveStatus status, std::string message)
@@ -1059,25 +1072,17 @@ private:
 
     void resetPerformanceCounters()
     {
-        _aec_frames         = 0;
-        _aec_time_us        = 0;
-        _aec_max_us         = 0;
         _send_frames        = 0;
         _send_time_us       = 0;
         _send_max_us        = 0;
         _playback_chunks    = 0;
         _playback_bytes     = 0;
         _playback_max_depth = 0;
-        _playback_underruns = 0;
-        _playback_drops     = 0;
         _uplink_max_depth   = 0;
-        _uplink_drops       = 0;
-        _uplink_send_timeouts = 0;
     }
 
     void logPerformanceCounters()
     {
-        const uint32_t aec_frames  = _aec_frames;
         const uint32_t send_frames = _send_frames;
         mclog::tagInfo(kTag, "Stack unused: capture={}B send={}B playback={}B; free internal={}B",
                        _capture_task ? uxTaskGetStackHighWaterMark(_capture_task) : 0,
@@ -1085,29 +1090,18 @@ private:
                        _playback_task ? uxTaskGetStackHighWaterMark(_playback_task) : 0,
                        heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
         mclog::tagInfo(kTag,
-                       "Perf: AEC avg={}us max={}us; send avg={}us max={}us; "
-                       "uplink max_queue={} drops={} timeouts={}; "
-                       "playback chunks={} bytes={} max_queue={} underruns={} drops={}",
-                       aec_frames ? static_cast<uint32_t>(_aec_time_us) / aec_frames : 0,
-                       static_cast<uint32_t>(_aec_max_us),
+                       "Perf: send avg={}us max={}us; uplink max_queue={}; "
+                       "playback chunks={} bytes={} max_queue={}",
                        send_frames ? static_cast<uint32_t>(_send_time_us) / send_frames : 0,
                        static_cast<uint32_t>(_send_max_us), static_cast<uint32_t>(_uplink_max_depth),
-                       static_cast<uint32_t>(_uplink_drops), static_cast<uint32_t>(_uplink_send_timeouts),
                        static_cast<uint32_t>(_playback_chunks),
-                       static_cast<uint32_t>(_playback_bytes), static_cast<uint32_t>(_playback_max_depth),
-                       static_cast<uint32_t>(_playback_underruns), static_cast<uint32_t>(_playback_drops));
+                       static_cast<uint32_t>(_playback_bytes), static_cast<uint32_t>(_playback_max_depth));
     }
 
     AudioCodec* _codec = nullptr;
-    aec_handle_t* _aec = nullptr;
     esp_ae_rate_cvt_handle_t _input_resampler = nullptr;
-    int16_t* _aec_mic = nullptr;
-    int16_t* _aec_reference = nullptr;
-    int16_t* _aec_output = nullptr;
-    size_t _aec_chunk_frames = 0;
     uint32_t _resampled_capacity = 0;
-    InternalAudioBuffer _aec_input;
-    // Queue discard and the active send workspace stay in internal SRAM.
+    // Capture and send each own one packet in internal SRAM.
     AudioFrame* _active_audio_frames = nullptr;
     uint8_t* _uplink_queue_storage = nullptr;
     StaticQueue_t _uplink_queue_control{};
@@ -1120,37 +1114,39 @@ private:
     TaskHandle_t _capture_task       = nullptr;
     TaskHandle_t _send_task          = nullptr;
     TaskHandle_t _playback_task      = nullptr;
+    std::atomic<bool> _capture_finished = true;
+    std::atomic<bool> _send_finished = true;
+    std::atomic<bool> _playback_finished = true;
     std::atomic<bool> _running       = false;
     std::atomic<bool> _stopping      = false;
     std::atomic<bool> _resetting     = false;
     std::atomic<bool> _connected     = false;
     std::atomic<bool> _setup_send_pending = false;
-    std::atomic<bool> _start_pending = false;
-    std::atomic<bool> _streaming     = false;
-    std::atomic<bool> _speaking      = false;
-    std::atomic<bool> _turn_complete = false;
+    std::atomic<bool> _session_ready = false;
+    std::atomic<bool> _server_turn_active = false;
     std::atomic<bool> _transport_failed = false;
-    std::atomic<bool> _reset_audio_pipeline = false;
+    std::atomic<bool> _capture_failed = false;
+    std::atomic<bool> _uplink_overflow = false;
+    std::atomic<bool> _reset_pending = false;
     std::atomic<bool> _rate_mismatch_logged = false;
-    std::atomic<bool> _stop_turn_pending    = false;
-    std::atomic<uint32_t> _setup_started_at = 0;
     std::atomic<uint32_t> _connected_at = 0;
-    std::atomic<uint32_t> _aec_frames = 0;
-    std::atomic<uint32_t> _aec_time_us = 0;
-    std::atomic<uint32_t> _aec_max_us = 0;
+    // Protected by _state_mutex, including response and playback ownership.
+    gemini::TurnState _turn;
+    bool _capture_pending = false;
+    bool _accept_response = false;
+    bool _turn_complete = false;
+    uint32_t _turn_started_at = 0;
+    uint32_t _response_started_at = 0;
     std::atomic<uint32_t> _send_frames = 0;
     std::atomic<uint32_t> _send_time_us = 0;
     std::atomic<uint32_t> _send_max_us = 0;
     std::atomic<uint32_t> _playback_chunks = 0;
     std::atomic<uint32_t> _playback_bytes = 0;
     std::atomic<uint32_t> _playback_max_depth = 0;
-    std::atomic<uint32_t> _playback_underruns = 0;
-    std::atomic<uint32_t> _playback_drops = 0;
     std::atomic<uint32_t> _uplink_max_depth = 0;
-    std::atomic<uint32_t> _uplink_drops = 0;
-    std::atomic<uint32_t> _uplink_send_timeouts = 0;
     std::mutex _protocol_mutex;
-    std::mutex _playback_mutex;
+    std::mutex _state_mutex;
+    std::mutex _codec_mutex;
     PsramPlaybackQueue _playback;
     size_t _playback_queued_samples = 0;
 };
@@ -1179,6 +1175,13 @@ void Hal::stopGeminiLiveTurn()
 {
     if (gemini_live_client) {
         gemini_live_client->stopTurn();
+    }
+}
+
+void Hal::resetGeminiLiveConversation()
+{
+    if (gemini_live_client) {
+        gemini_live_client->resetConversation();
     }
 }
 

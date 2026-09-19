@@ -87,6 +87,21 @@ void Servo::moveWithSpeed(int angle, int speed)
     moveWithSpringParams(angle, spring_options.stiffness, spring_options.damping);
 }
 
+void Servo::setMotionPaused(bool paused)
+{
+    if (_motion_paused == paused) {
+        return;
+    }
+    _motion_paused = paused;
+    if (paused) {
+        const int angle = uitk::clamp(getCurrentAngle(), _angle_limit.x, _angle_limit.y);
+        stop_motion_at_angle(angle);
+        _angle_anim.complete();
+        _angle_anim.updateWithDelta(0.0f);
+        set_angle_impl(angle);
+    }
+}
+
 int Servo::getCurrentAngle()
 {
     return _angle_anim.directValue();
@@ -107,6 +122,9 @@ void Servo::apply_default_spring_options()
 
 void Servo::update_angle_anim_target(int angle)
 {
+    if (_motion_paused) {
+        return;
+    }
     angle = uitk::clamp(angle, _angle_limit.x, _angle_limit.y);
 
     if (_auto_angle_sync_enabled) {

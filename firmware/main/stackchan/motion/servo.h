@@ -54,6 +54,10 @@ public:
      */
     void moveWithSpeed(int angle, int speed);
 
+    // Motion pause cancels the current trajectory and discards position commands until resumed.
+    void setMotionPaused(bool paused);
+    bool isMotionPaused() const { return _motion_paused; }
+
     /**
      * @brief Rotate servo with given velocity
      *
@@ -174,6 +178,7 @@ protected:
     bool _snap_to_target_on_rest      = false;
     bool _auto_torque_release_enabled = true;
     bool _auto_angle_sync_enabled     = true;
+    bool _motion_paused               = false;
 
     void apply_default_spring_options();
     void update_angle_anim_target(int angle);

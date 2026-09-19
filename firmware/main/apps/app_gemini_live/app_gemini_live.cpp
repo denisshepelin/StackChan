@@ -59,7 +59,27 @@ void AppGeminiLive::onOpen()
 
     auto avatar = std::make_unique<avatar::DefaultAvatar>();
     avatar->init(lv_screen_active());
-    avatar->getPanel()->onClick().connect([this]() { _face_clicked = true; });
+    auto* face_panel = avatar->getPanel()->get();
+    lv_obj_add_flag(face_panel, LV_OBJ_FLAG_PRESS_LOCK);
+    lv_obj_tree_walk(face_panel, [](lv_obj_t* object, void* panel) {
+        if (object != panel) {
+            lv_obj_remove_flag(object, LV_OBJ_FLAG_CLICKABLE);
+        }
+        return LV_OBJ_TREE_WALK_NEXT;
+    }, face_panel);
+    lv_obj_add_event_cb(face_panel, [](lv_event_t* event) {
+        const auto code = lv_event_get_code(event);
+        if (code == LV_EVENT_PRESSED) {
+            auto& motion = GetStackChan().motion();
+            const bool was_paused = motion.isMotionPaused();
+            motion.setMotionPaused(true);
+            if (!GetHAL().startGeminiLiveTurn()) {
+                motion.setMotionPaused(was_paused);
+            }
+        } else if (code == LV_EVENT_RELEASED || code == LV_EVENT_PRESS_LOST) {
+            GetHAL().stopGeminiLiveTurn();
+        }
+    }, LV_EVENT_ALL, nullptr);
     GetStackChan().attachAvatar(std::move(avatar));
 
     auto& stackchan = GetStackChan();
@@ -67,6 +87,11 @@ void AppGeminiLive::onOpen()
     stackchan.addModifier(std::make_unique<BlinkModifier>());
     stackchan.addModifier(std::make_unique<HeadPetModifier>());
     stackchan.addModifier(std::make_unique<ImuEventModifier>());
+    _imu_connection = GetHAL().onImuMotionEvent.connect([this](ImuMotionEvent event) {
+        if (event == ImuMotionEvent::Shake) {
+            _conversation_reset_pending = true;
+        }
+    });
     stackchan.addModifier(std::make_unique<IdleMotionModifier>());
     stackchan.addModifier(std::make_unique<IdleExpressionModifier>());
 
@@ -79,20 +104,8 @@ void AppGeminiLive::onRunning()
     LvglLockGuard lock;
     auto& stackchan = GetStackChan();
 
-    if (_face_clicked.exchange(false)) {
-        stackchan.addModifier(std::make_unique<TimedEmotionModifier>(avatar::Emotion::Happy, 1200));
-        if (_turn_active) {
-            GetHAL().stopGeminiLiveTurn();
-            GetHAL().showRgbColor(0, 0, 0);
-            _turn_active = false;
-        } else {
-            GetHAL().showRgbColor(0, 50, 0);
-            _turn_active = true;
-            if (!GetHAL().startGeminiLiveTurn()) {
-                GetHAL().showRgbColor(0, 0, 0);
-                _turn_active = false;
-            }
-        }
+    if (_conversation_reset_pending.exchange(false)) {
+        GetHAL().resetGeminiLiveConversation();
     }
 
     GeminiLiveStatus status;
@@ -109,6 +122,9 @@ void AppGeminiLive::onRunning()
     }
 
     if (status_pending) {
+        stackchan.motion().setMotionPaused(status == GeminiLiveStatus::Listening ||
+                                          status == GeminiLiveStatus::Thinking ||
+                                          status == GeminiLiveStatus::Speaking);
         auto& face = stackchan.avatar();
         if (_speaking_modifier_id >= 0 && status != GeminiLiveStatus::Speaking) {
             stackchan.removeModifier(_speaking_modifier_id);
@@ -125,10 +141,27 @@ void AppGeminiLive::onRunning()
             face.setSpeech(message);
         }
 
-        if (status == GeminiLiveStatus::Error) {
-            GetHAL().showRgbColor(0, 0, 0);
-            _turn_active = false;
-            stackchan.addModifier(std::make_unique<TimedEmotionModifier>(avatar::Emotion::Sad, 4000));
+        switch (status) {
+            case GeminiLiveStatus::Listening:
+                GetHAL().showRgbColor(0, 50, 0);
+                face.setEmotion(avatar::Emotion::Happy);
+                break;
+            case GeminiLiveStatus::Thinking:
+                GetHAL().showRgbColor(25, 15, 0);
+                face.setEmotion(avatar::Emotion::Doubt);
+                break;
+            case GeminiLiveStatus::Speaking:
+                GetHAL().showRgbColor(0, 0, 35);
+                face.setEmotion(avatar::Emotion::Happy);
+                break;
+            case GeminiLiveStatus::Error:
+                GetHAL().showRgbColor(0, 0, 0);
+                face.setEmotion(avatar::Emotion::Sad);
+                break;
+            default:
+                GetHAL().showRgbColor(0, 0, 0);
+                face.setEmotion(avatar::Emotion::Neutral);
+                break;
         }
     }
 
@@ -141,13 +174,15 @@ void AppGeminiLive::onClose()
 {
     mclog::tagInfo(kTag, "on close");
 
-    GetHAL().onGeminiLiveStatus.clear();
+    GetHAL().onImuMotionEvent.disconnect(_imu_connection);
     GetHAL().stopGeminiLiveService();
+    GetHAL().onGeminiLiveStatus.clear();
     GetHAL().showRgbColor(0, 0, 0);
 
     {
         LvglLockGuard lock;
         GetStackChan().clearModifiers();
+        GetStackChan().motion().setMotionPaused(false);
         GetStackChan().resetAvatar();
         view::destroy_home_indicator();
         view::destroy_status_bar();
